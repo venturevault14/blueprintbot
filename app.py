@@ -1122,13 +1122,12 @@ async def general_exception_handler(request: Request, exc: Exception):
         ).dict()
     )
 
+# At the very end of your app.py, replace the Vercel Handler section with this:
+
 # ========================================
-# Vercel Handler
+# Local Development Only
 # ========================================
 
-# For Vercel deployment
-from mangum import Mangum
-handler = Mangum(app)
-
+# Remove all handler exports - let Vercel handle this through api/index.py
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
