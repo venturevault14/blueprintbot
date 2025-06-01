@@ -28,17 +28,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Pinecone import (modern version)
-# Pinecone import (modern version)
 try:
     from pinecone import Pinecone
     print("✅ Modern Pinecone client available")
 except ImportError:
     print("❌ Modern Pinecone client not found. Please install: pip install pinecone")
     raise ImportError("Please install modern Pinecone: pip install pinecone")
-
-# FastAPI and related imports
-
-# OpenAI import
 
 # ========================================
 # Configuration from Environment Variables
@@ -83,6 +78,15 @@ except ValueError as e:
     logger.error(f"Configuration error: {e}")
     raise
 
+# Debug environment variables
+logger.info("=== Environment Variables Debug ===")
+logger.info(f"OPENAI_API_KEY present: {'Yes' if config.OPENAI_API_KEY else 'No'}")
+logger.info(f"OPENAI_API_KEY length: {len(config.OPENAI_API_KEY) if config.OPENAI_API_KEY else 0}")
+logger.info(f"PINECONE_API_KEY present: {'Yes' if config.PINECONE_API_KEY else 'No'}")
+logger.info(f"INDEX_NAME: {config.INDEX_NAME}")
+logger.info(f"ASSISTANT_ID: {config.ASSISTANT_ID}")
+logger.info("=== End Debug ===")
+
 # ========================================
 # Global Variables and Constants
 # ========================================
@@ -116,39 +120,48 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up medical triage application...")
 
     try:
-        # Initialize OpenAI client
+        # More detailed OpenAI client initialization
+        if not config.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
+        
+        logger.info("Initializing OpenAI client...")
         openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-        logger.info("OpenAI client initialized successfully")
-
-        # Initialize Pinecone (force modern client for serverless)
-        logger.info("Initializing Pinecone for serverless index...")
-
+        
+        # Test the OpenAI client
         try:
-            # Force use of modern Pinecone client for serverless
-            from pinecone import Pinecone
-            pinecone_client = Pinecone(api_key=config.PINECONE_API_KEY)
-            logger.info("✅ Modern Pinecone client initialized")
-
-            # Connect directly to serverless index (no environment needed)
-            index = pinecone_client.Index(name=config.INDEX_NAME)
-
-            # Test the connection
-            stats = index.describe_index_stats()
-            logger.info(
-                f"✅ Successfully connected to serverless index '{config.INDEX_NAME}'")
-            logger.info(f"📊 Index stats: {stats.total_vector_count} vectors")
-
-        except ImportError:
-            logger.error(
-                "❌ Modern Pinecone client not available. Please install: pip install pinecone")
-            raise RuntimeError(
-                "Modern Pinecone client required for serverless indexes")
+            await openai_client.models.list()
+            logger.info("✅ OpenAI client tested successfully")
         except Exception as e:
-            logger.error(
-                f"❌ Failed to connect to Pinecone serverless index: {e}")
-            logger.info(
-                "💡 Note: Make sure your index name is correct and API key is valid")
+            logger.error(f"❌ OpenAI client test failed: {e}")
             raise
+        
+        logger.info("✅ OpenAI client initialized successfully")
+
+        # Initialize Pinecone with better error handling
+        if not config.PINECONE_API_KEY:
+            logger.warning("⚠️ PINECONE_API_KEY not set - Pinecone features will be disabled")
+            pinecone_client = None
+            index = None
+        else:
+            logger.info("Initializing Pinecone for serverless index...")
+            try:
+                from pinecone import Pinecone
+                pinecone_client = Pinecone(api_key=config.PINECONE_API_KEY)
+                logger.info("✅ Modern Pinecone client initialized")
+
+                # Connect directly to serverless index
+                index = pinecone_client.Index(name=config.INDEX_NAME)
+
+                # Test the connection
+                stats = index.describe_index_stats()
+                logger.info(f"✅ Successfully connected to serverless index '{config.INDEX_NAME}'")
+                logger.info(f"📊 Index stats: {stats.total_vector_count} vectors")
+
+            except Exception as e:
+                logger.error(f"❌ Failed to connect to Pinecone: {e}")
+                logger.info("⚠️ Continuing without Pinecone - some features will be limited")
+                pinecone_client = None
+                index = None
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -457,6 +470,11 @@ def is_red_flag(text: str, severity: int = 0) -> bool:
 
 async def should_query_pinecone_database(context: Dict) -> bool:
     """Determine if we should query the medical database"""
+    # Skip if Pinecone is not available
+    if not index:
+        logger.info("Pinecone not available - skipping database query")
+        return False
+        
     all_symptoms = context.get("all_symptoms", [])
     symptom_count = len(all_symptoms)
     max_severity = context.get("max_severity", 0)
@@ -507,6 +525,10 @@ async def get_embeddings(texts: List[str]) -> Optional[List[List[float]]]:
 async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
     """Query Pinecone index for medical conditions"""
     try:
+        if not index:
+            logger.warning("Pinecone index not available")
+            return []
+            
         query_embedding = await get_embeddings([query_text])
         if not query_embedding:
             logger.error("Failed to generate query embedding")
@@ -978,24 +1000,42 @@ async def generate_phase2_response(context: Dict, is_emergency: bool, thread_id:
 async def triage(request: TriageRequest):
     """Main triage endpoint with enhanced intent classification"""
     try:
+        # Check if OpenAI client is initialized
+        if openai_client is None:
+            logger.error("OpenAI client not initialized")
+            raise HTTPException(
+                status_code=503, 
+                detail="OpenAI service unavailable. Please check configuration."
+            )
+        
         description = request.description.strip()
         thread_id = request.thread_id
 
-        logger.info(
-            f"Triage request: '{description[:50]}...', thread: {thread_id}")
+        logger.info(f"Triage request: '{description[:50]}...', thread: {thread_id}")
 
         # Validate or create thread
         if not thread_id or not await validate_thread(thread_id):
-            new_thread = await openai_client.beta.threads.create()
-            thread_id = new_thread.id
-            logger.info(f"Created new thread: {thread_id}")
+            try:
+                new_thread = await openai_client.beta.threads.create()
+                thread_id = new_thread.id
+                logger.info(f"Created new thread: {thread_id}")
+            except Exception as e:
+                logger.error(f"Failed to create OpenAI thread: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Unable to create conversation thread. Please try again."
+                )
 
         # Add user message to thread
-        await openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=description
-        )
+        try:
+            await openai_client.beta.threads.messages.create(
+                thread_id=thread_id,
+                role="user",
+                content=description
+            )
+        except Exception as e:
+            logger.error(f"Failed to add message to thread: {e}")
+            # Continue anyway - we can still provide a response
 
         # ═══ NEW: Quick GPT-based intent classification ═══
         intent_label = await classify_intent_with_gpt(description)
@@ -1021,11 +1061,9 @@ async def triage(request: TriageRequest):
             symptom_count = len(context["all_symptoms"])
             max_severity = context["max_severity"]
             should_query = await should_query_pinecone_database(context)
-            is_emergency = is_red_flag(
-                " ".join(context["user_messages"]), max_severity)
+            is_emergency = is_red_flag(" ".join(context["user_messages"]), max_severity)
 
-            logger.info(
-                f"Medical analysis - Intent: {intents}, Symptoms: {symptom_count}, Emergency: {is_emergency}")
+            logger.info(f"Medical analysis - Intent: {intents}, Symptoms: {symptom_count}, Emergency: {is_emergency}")
 
             # Route to appropriate response generator
             if "non_medical" in intents and not context["all_symptoms"]:
@@ -1035,14 +1073,19 @@ async def triage(request: TriageRequest):
             else:
                 return await generate_phase1_response(description, context, thread_id)
 
-        # Fallback (shouldn't reach here normally)
+        # Fallback
         else:
             return await generate_non_medical_response(thread_id)
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error in triage endpoint: {e}")
         raise HTTPException(
-            status_code=500, detail=f"Internal server error: {str(e)}")
+            status_code=500, 
+            detail=f"Internal server error: {str(e)}"
+        )
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1060,12 +1103,15 @@ async def health_check():
         pinecone_status = "healthy"
         try:
             # Test by getting index stats (works for serverless)
-            index.describe_index_stats()
+            if index:
+                index.describe_index_stats()
+            else:
+                pinecone_status = "unavailable"
         except Exception:
             pinecone_status = "unhealthy"
 
         return HealthResponse(
-            status="healthy" if openai_status == "healthy" and pinecone_status == "healthy" else "degraded",
+            status="healthy" if openai_status == "healthy" else "degraded",
             timestamp=datetime.utcnow().isoformat(),
             version="1.0.0",
             services={
@@ -1081,6 +1127,19 @@ async def health_check():
             version="1.0.0",
             services={"error": str(e)}
         )
+
+
+@app.get("/debug-env")
+async def debug_env():
+    """Debug endpoint to check environment variables"""
+    return {
+        "openai_key_present": bool(config.OPENAI_API_KEY),
+        "openai_key_length": len(config.OPENAI_API_KEY) if config.OPENAI_API_KEY else 0,
+        "pinecone_key_present": bool(config.PINECONE_API_KEY),
+        "index_name": config.INDEX_NAME,
+        "assistant_id": config.ASSISTANT_ID,
+        "openai_client_status": "initialized" if openai_client else "not_initialized"
+    }
 
 
 @app.get("/")
@@ -1121,8 +1180,6 @@ async def general_exception_handler(request: Request, exc: Exception):
             timestamp=datetime.utcnow().isoformat()
         ).dict()
     )
-
-# At the very end of your app.py, replace the Vercel Handler section with this:
 
 # ========================================
 # Local Development Only
