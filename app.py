@@ -1127,8 +1127,8 @@ async def general_exception_handler(request: Request, exc: Exception):
 # ========================================
 
 # For Vercel deployment
-handler = app
+from mangum import Mangum
+handler = Mangum(app)
 
-# For local development
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
