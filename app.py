@@ -214,29 +214,38 @@ class ErrorResponse(BaseModel):
 # ========================================
 
 async def validate_thread(thread_id: str) -> bool:
-    """Check if an OpenAI thread ID is valid"""
+    """Check if an OpenAI thread ID is valid - with better error handling"""
+    if not thread_id or thread_id.strip() == "":
+        logger.info("No thread ID provided")
+        return False
+        
     try:
         client = await get_openai_client()
-        await client.beta.threads.retrieve(thread_id=thread_id)
-        logger.info(f"Thread {thread_id} validated successfully")
+        thread = await client.beta.threads.retrieve(thread_id=thread_id.strip())
+        logger.info(f"✅ Thread {thread_id} validated successfully")
         return True
     except Exception as e:
-        logger.error(f"Thread validation failed for {thread_id}: {e}")
+        logger.error(f"❌ Thread validation failed for {thread_id}: {e}")
         return False
 
 async def get_thread_context(thread_id: str) -> Dict:
-    """Retrieve and analyze thread context"""
+    """Retrieve and analyze thread context - with better debugging"""
     try:
         client = await get_openai_client()
+        logger.info(f"🔍 Retrieving context for thread: {thread_id}")
+        
         messages = await client.beta.threads.messages.list(
             thread_id=thread_id,
-            order='asc'
+            order='asc',
+            limit=100  # Get more messages for better context
         )
 
         user_messages = []
         assistant_count = 0
         all_symptoms = []
         max_severity = 0
+
+        logger.info(f"📝 Found {len(messages.data)} messages in thread")
 
         for msg in messages.data:
             if msg.role == "user":
@@ -245,9 +254,14 @@ async def get_thread_context(thread_id: str) -> Dict:
                     content = msg.content[0].text.value
                 if content:
                     user_messages.append(content)
+                    logger.info(f"👤 User message: {content[:50]}...")
+                    
+                    # Extract symptoms from this message
                     symptom_data = await extract_symptoms_comprehensive(content)
                     all_symptoms.extend(symptom_data["symptoms"])
                     max_severity = max(max_severity, symptom_data["severity"])
+                    
+                    logger.info(f"🩺 Extracted symptoms: {symptom_data['symptoms']}")
             elif msg.role == "assistant":
                 assistant_count += 1
 
@@ -260,15 +274,22 @@ async def get_thread_context(thread_id: str) -> Dict:
                 seen.add(symptom_clean)
                 unique_symptoms.append(symptom_clean)
 
-        return {
+        context = {
             "user_messages": user_messages,
             "assistant_responses": assistant_count,
             "all_symptoms": unique_symptoms,
             "max_severity": max_severity
         }
+        
+        logger.info(f"📊 Thread context summary:")
+        logger.info(f"   - User messages: {len(user_messages)}")
+        logger.info(f"   - All symptoms: {unique_symptoms}")
+        logger.info(f"   - Max severity: {max_severity}")
+        
+        return context
 
     except Exception as e:
-        logger.error(f"Error retrieving thread context for {thread_id}: {e}")
+        logger.error(f"❌ Error retrieving thread context for {thread_id}: {e}")
         return {
             "user_messages": [],
             "assistant_responses": 0,
@@ -947,7 +968,7 @@ async def generate_phase2_response(context: Dict, is_emergency: bool, thread_id:
 
 @app.post("/triage", response_model=TriageResponse)
 async def triage(request: TriageRequest):
-    """Main triage endpoint with enhanced intent classification"""
+    """Main triage endpoint with enhanced intent classification and fixed thread management"""
     try:
         # Get OpenAI client (initialize if needed)
         client = await get_openai_client()
@@ -955,16 +976,28 @@ async def triage(request: TriageRequest):
         description = request.description.strip()
         thread_id = request.thread_id
 
-        logger.info(f"Triage request: '{description[:50]}...', thread: {thread_id}")
+        logger.info(f"🚀 Triage request: '{description[:50]}...', provided thread: {thread_id}")
 
-        # Validate or create thread
-        if not thread_id or not await validate_thread(thread_id):
+        # FIXED: Better thread validation and management
+        use_existing_thread = False
+        if thread_id and thread_id.strip():
+            # Try to validate the provided thread
+            if await validate_thread(thread_id.strip()):
+                use_existing_thread = True
+                thread_id = thread_id.strip()
+                logger.info(f"✅ Using existing thread: {thread_id}")
+            else:
+                logger.warning(f"⚠️ Invalid thread provided: {thread_id}, creating new one")
+                use_existing_thread = False
+
+        # Create new thread only if we don't have a valid existing one
+        if not use_existing_thread:
             try:
                 new_thread = await client.beta.threads.create()
                 thread_id = new_thread.id
-                logger.info(f"Created new thread: {thread_id}")
+                logger.info(f"🆕 Created new thread: {thread_id}")
             except Exception as e:
-                logger.error(f"Failed to create OpenAI thread: {e}")
+                logger.error(f"❌ Failed to create OpenAI thread: {e}")
                 raise HTTPException(
                     status_code=503,
                     detail="Unable to create conversation thread. Please try again."
@@ -977,13 +1010,14 @@ async def triage(request: TriageRequest):
                 role="user",
                 content=description
             )
+            logger.info(f"✅ Added user message to thread {thread_id}")
         except Exception as e:
-            logger.error(f"Failed to add message to thread: {e}")
+            logger.error(f"❌ Failed to add message to thread: {e}")
             # Continue anyway - we can still provide a response
 
         # Quick GPT-based intent classification
         intent_label = await classify_intent_with_gpt(description)
-        logger.info(f"Intent classified as: {intent_label}")
+        logger.info(f"🎯 Intent classified as: {intent_label}")
 
         # Handle conversational intents with friendly responses
         if intent_label == "GREETING":
@@ -995,7 +1029,7 @@ async def triage(request: TriageRequest):
 
         # For SYMPTOM_REPORT and OTHER, continue with existing medical logic
         elif intent_label in ["SYMPTOM_REPORT", "OTHER"]:
-            # Get thread context
+            # Get thread context - this should now include ALL previous messages
             context = await get_thread_context(thread_id)
             intent_result = await detect_intent(description, thread_id)
             intents = intent_result["intent"]
@@ -1005,7 +1039,11 @@ async def triage(request: TriageRequest):
             should_query = await should_query_pinecone_database(context)
             is_emergency = is_red_flag(" ".join(context["user_messages"]), max_severity)
 
-            logger.info(f"Medical analysis - Intent: {intents}, Symptoms: {symptom_count}, Emergency: {is_emergency}")
+            logger.info(f"🩺 Medical analysis:")
+            logger.info(f"   - Intent: {intents}")
+            logger.info(f"   - Total symptoms: {symptom_count} ({context['all_symptoms']})")
+            logger.info(f"   - Emergency: {is_emergency}")
+            logger.info(f"   - Should query Pinecone: {should_query}")
 
             # Route to appropriate response generator
             if "non_medical" in intents and not context["all_symptoms"]:
@@ -1022,7 +1060,7 @@ async def triage(request: TriageRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in triage endpoint: {e}")
+        logger.error(f"❌ Error in triage endpoint: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Internal server error: {str(e)}"
