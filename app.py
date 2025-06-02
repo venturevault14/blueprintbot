@@ -39,7 +39,6 @@ except ImportError:
 # Configuration from Environment Variables
 # ========================================
 
-
 class Config:
     def __init__(self):
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -61,12 +60,11 @@ class Config:
 
     def validate(self):
         """Validate required environment variables"""
-        required_vars = ["OPENAI_API_KEY", "PINECONE_API_KEY"]
+        required_vars = ["OPENAI_API_KEY"]
         missing = [var for var in required_vars if not getattr(self, var)]
         if missing:
             raise ValueError(
                 f"Missing required environment variables: {missing}")
-
 
 config = Config()
 
@@ -101,92 +99,70 @@ RED_FLAGS = [
     "blood in urine", "inability to pass urine", "sharp abdominal pain", "intermenstrual bleeding"
 ]
 
-# Global clients (initialized in lifespan)
+# Global clients (initialized lazily)
 openai_client = None
 pinecone_client = None
 index = None
 
 # ========================================
-# Application Lifespan Management
+# Lazy Initialization Functions
 # ========================================
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage application startup and shutdown"""
-    global openai_client, pinecone_client, index
-
-    # Startup
-    logger.info("Starting up medical triage application...")
-
-    try:
-        # More detailed OpenAI client initialization
+async def get_openai_client():
+    """Get or initialize OpenAI client lazily"""
+    global openai_client
+    
+    if openai_client is None:
         if not config.OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
+            logger.error("OPENAI_API_KEY not configured")
+            raise HTTPException(
+                status_code=503,
+                detail="OpenAI API key not configured"
+            )
         
-        logger.info("Initializing OpenAI client...")
-        openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-        
-        # Test the OpenAI client
         try:
-            await openai_client.models.list()
-            logger.info("✅ OpenAI client tested successfully")
+            logger.info("Lazy initializing OpenAI client...")
+            openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+            logger.info("✅ OpenAI client initialized successfully")
         except Exception as e:
-            logger.error(f"❌ OpenAI client test failed: {e}")
-            raise
-        
-        logger.info("✅ OpenAI client initialized successfully")
+            logger.error(f"Failed to initialize OpenAI client: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to initialize OpenAI client: {str(e)}"
+            )
+    
+    return openai_client
 
-        # Initialize Pinecone with better error handling
-        if not config.PINECONE_API_KEY:
-            logger.warning("⚠️ PINECONE_API_KEY not set - Pinecone features will be disabled")
-            pinecone_client = None
-            index = None
-        else:
-            logger.info("Initializing Pinecone for serverless index...")
-            try:
-                from pinecone import Pinecone
-                pinecone_client = Pinecone(api_key=config.PINECONE_API_KEY)
-                logger.info("✅ Modern Pinecone client initialized")
-
-                # Connect directly to serverless index
-                index = pinecone_client.Index(name=config.INDEX_NAME)
-
-                # Test the connection
-                stats = index.describe_index_stats()
-                logger.info(f"✅ Successfully connected to serverless index '{config.INDEX_NAME}'")
-                logger.info(f"📊 Index stats: {stats.total_vector_count} vectors")
-
-            except Exception as e:
-                logger.error(f"❌ Failed to connect to Pinecone: {e}")
-                logger.info("⚠️ Continuing without Pinecone - some features will be limited")
-                pinecone_client = None
-                index = None
-
-    except Exception as e:
-        logger.error(f"Failed to initialize services: {e}")
-        raise
-
-    yield
-
-    # Shutdown
-    logger.info("Shutting down medical triage application...")
+def get_pinecone_index():
+    """Get or initialize Pinecone index lazily"""
+    global pinecone_client, index
+    
+    if index is None and config.PINECONE_API_KEY:
+        try:
+            logger.info("Lazy initializing Pinecone...")
+            pinecone_client = Pinecone(api_key=config.PINECONE_API_KEY)
+            index = pinecone_client.Index(name=config.INDEX_NAME)
+            logger.info("✅ Pinecone initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Pinecone: {e}")
+            # Don't raise - just continue without Pinecone
+    
+    return index
 
 # ========================================
-# FastAPI App Configuration
+# FastAPI App Configuration (Simple Startup)
 # ========================================
 
 app = FastAPI(
     title="Medical Triage Assistant API",
     description="AI-powered medical triage assistant for symptom assessment and condition suggestions",
-    version="1.0.0",
-    lifespan=lifespan
+    version="1.0.0"
 )
 
 # CORS middleware for web deployment
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -196,24 +172,20 @@ app.add_middleware(
 # Pydantic Models
 # ========================================
 
-
 class TriageRequest(BaseModel):
     description: str = Field(..., min_length=1, max_length=1000,
                              description="User's symptom description")
     thread_id: Optional[str] = Field(
         None, description="Thread ID for conversation continuity")
 
-
 class ConditionInfo(BaseModel):
     name: str
     description: str
     file_citation: str
 
-
 class TriageInfo(BaseModel):
     type: str
     location: str
-
 
 class TriageResponse(BaseModel):
     text: str
@@ -226,13 +198,11 @@ class TriageResponse(BaseModel):
     symptoms_count: int = 0
     should_query_pinecone: bool = False
 
-
 class HealthResponse(BaseModel):
     status: str
     timestamp: str
     version: str
     services: Dict[str, str]
-
 
 class ErrorResponse(BaseModel):
     error: str
@@ -243,22 +213,22 @@ class ErrorResponse(BaseModel):
 # Utility Functions
 # ========================================
 
-
 async def validate_thread(thread_id: str) -> bool:
     """Check if an OpenAI thread ID is valid"""
     try:
-        await openai_client.beta.threads.retrieve(thread_id=thread_id)
+        client = await get_openai_client()
+        await client.beta.threads.retrieve(thread_id=thread_id)
         logger.info(f"Thread {thread_id} validated successfully")
         return True
     except Exception as e:
         logger.error(f"Thread validation failed for {thread_id}: {e}")
         return False
 
-
 async def get_thread_context(thread_id: str) -> Dict:
     """Retrieve and analyze thread context"""
     try:
-        messages = await openai_client.beta.threads.messages.list(
+        client = await get_openai_client()
+        messages = await client.beta.threads.messages.list(
             thread_id=thread_id,
             order='asc'
         )
@@ -306,70 +276,10 @@ async def get_thread_context(thread_id: str) -> Dict:
             "max_severity": 0
         }
 
-
-async def detect_intent(description: str, thread_id: Optional[str] = None) -> Dict:
-    """Detect user intent using GPT-4"""
-    try:
-        # Check for prior medical context
-        has_prior_symptoms = False
-        if thread_id and await validate_thread(thread_id):
-            context = await get_thread_context(thread_id)
-            if context["all_symptoms"]:
-                has_prior_symptoms = True
-                logger.info(
-                    f"Thread {thread_id} has prior symptoms; forcing medical intent")
-
-        prompt = (
-            "You are a medical intent classifier. Analyze the input and classify the intent as one or more of: "
-            "'medical' (describes symptoms), 'contextual' (provides follow-up details), or 'non_medical' (greetings/general). "
-            "Also extract any symptom entities mentioned. "
-            "Return JSON: {'intent': ['medical'], 'symptoms': ['symptom1', 'symptom2']}"
-        )
-
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": description}
-            ],
-            temperature=0.2,
-            max_tokens=200
-        )
-
-        try:
-            result = json.loads(response.choices[0].message.content.strip())
-            intents = result.get("intent", ["medical"])
-            symptoms = result.get("symptoms", [])
-        except json.JSONDecodeError:
-            logger.warning(
-                "GPT returned invalid JSON for intent detection, using fallback")
-            intents = ["medical"]
-            symptoms = []
-
-        # Ensure medical intent if prior symptoms exist
-        if has_prior_symptoms and "medical" not in intents:
-            intents.append("medical")
-
-        # Validate intents
-        valid_intents = {"medical", "contextual", "non_medical"}
-        intents = [i for i in intents if i in valid_intents]
-        if not intents:
-            intents = ["medical"]
-
-        return {"intent": intents, "symptoms": symptoms}
-
-    except Exception as e:
-        logger.error(f"Intent detection error: {e}")
-        # Fallback to keyword-based detection
-        desc_lower = description.lower()
-        if any(keyword in desc_lower for keyword in ["hello", "hi", "what can you do"]):
-            return {"intent": ["non_medical"], "symptoms": []}
-        return {"intent": ["medical"], "symptoms": []}
-
-
 async def extract_symptoms_comprehensive(description: str) -> Dict:
     """Extract symptoms, duration, and severity from description"""
     try:
+        client = await get_openai_client()
         description_lower = description.lower()
 
         # Extract duration using regex
@@ -410,7 +320,7 @@ async def extract_symptoms_comprehensive(description: str) -> Dict:
             f"Text: \"{description}\""
         )
 
-        response = await openai_client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": prompt},
@@ -424,8 +334,7 @@ async def extract_symptoms_comprehensive(description: str) -> Dict:
             if not isinstance(symptoms, list):
                 symptoms = []
         except json.JSONDecodeError:
-            logger.warning(
-                "GPT returned invalid JSON for symptoms, using fallback")
+            logger.warning("GPT returned invalid JSON for symptoms, using fallback")
             symptoms = []
 
         # Normalize symptoms
@@ -437,14 +346,12 @@ async def extract_symptoms_comprehensive(description: str) -> Dict:
                 seen.add(symptom_clean)
                 unique_symptoms.append(symptom_clean)
 
-        logger.info(
-            f"Extracted: symptoms={unique_symptoms}, duration={duration}, severity={severity}")
+        logger.info(f"Extracted: symptoms={unique_symptoms}, duration={duration}, severity={severity}")
         return {"symptoms": unique_symptoms, "duration": duration, "severity": severity}
 
     except Exception as e:
         logger.error(f"Error extracting symptoms: {e}")
         return {"symptoms": [], "duration": None, "severity": 0}
-
 
 def is_red_flag(text: str, severity: int = 0) -> bool:
     """Check for emergency red flags"""
@@ -458,20 +365,18 @@ def is_red_flag(text: str, severity: int = 0) -> bool:
 
     # Check high severity with critical symptoms
     if severity >= 8:
-        critical_symptoms = ["chest pain",
-                             "abdominal pain", "breathing", "consciousness"]
+        critical_symptoms = ["chest pain", "abdominal pain", "breathing", "consciousness"]
         if any(symptom in text_lower for symptom in critical_symptoms):
-            logger.info(
-                f"High severity ({severity}) with critical symptom detected")
+            logger.info(f"High severity ({severity}) with critical symptom detected")
             return True
 
     return False
 
-
 async def should_query_pinecone_database(context: Dict) -> bool:
     """Determine if we should query the medical database"""
     # Skip if Pinecone is not available
-    if not index:
+    pinecone_index = get_pinecone_index()
+    if not pinecone_index:
         logger.info("Pinecone not available - skipping database query")
         return False
         
@@ -487,8 +392,7 @@ async def should_query_pinecone_database(context: Dict) -> bool:
 
     # Check symptom threshold
     if symptom_count >= config.MIN_SYMPTOMS_FOR_PINECONE:
-        logger.info(
-            f"Sufficient symptoms ({symptom_count}) - querying Pinecone")
+        logger.info(f"Sufficient symptoms ({symptom_count}) - querying Pinecone")
         return True
 
     # Check for explicit condition requests
@@ -500,140 +404,27 @@ async def should_query_pinecone_database(context: Dict) -> bool:
         logger.info("Explicit condition request - querying Pinecone")
         return True
 
-    logger.info(
-        f"Not querying Pinecone: {symptom_count} symptoms, no explicit request")
+    logger.info(f"Not querying Pinecone: {symptom_count} symptoms, no explicit request")
     return False
-
 
 async def get_embeddings(texts: List[str]) -> Optional[List[List[float]]]:
     """Get embeddings from OpenAI with retry logic"""
+    client = await get_openai_client()
     for attempt in range(config.MAX_RETRIES):
         try:
-            response = await openai_client.embeddings.create(
+            response = await client.embeddings.create(
                 input=texts,
                 model=config.EMBEDDING_MODEL
             )
             return [item.embedding for item in response.data]
         except Exception as e:
-            logger.error(
-                f"Embedding attempt {attempt+1}/{config.MAX_RETRIES} failed: {e}")
+            logger.error(f"Embedding attempt {attempt+1}/{config.MAX_RETRIES} failed: {e}")
             if attempt == config.MAX_RETRIES - 1:
                 return None
     return None
 
-
-async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
-    """Query Pinecone index for medical conditions"""
-    try:
-        if not index:
-            logger.warning("Pinecone index not available")
-            return []
-            
-        query_embedding = await get_embeddings([query_text])
-        if not query_embedding:
-            logger.error("Failed to generate query embedding")
-            return []
-
-        response = index.query(
-            vector=query_embedding[0],
-            top_k=top_k,
-            include_metadata=True
-        )
-
-        matches = response.get("matches", [])
-        logger.info(f"Pinecone returned {len(matches)} matches")
-
-        # Filter and deduplicate
-        unique_conditions = {}
-        for match in matches:
-            score = match.get("score", 0)
-            if score < config.PINECONE_SCORE_THRESHOLD:
-                continue
-
-            disease = match["metadata"].get("disease", "unknown").lower()
-            if disease not in unique_conditions or score > unique_conditions[disease]["score"]:
-                unique_conditions[disease] = {"match": match, "score": score}
-
-        selected_matches = [entry["match"]
-                            for entry in unique_conditions.values()]
-        logger.info(
-            f"Selected {len(selected_matches)} unique conditions after filtering")
-        return selected_matches
-
-    except Exception as e:
-        logger.error(f"Error querying Pinecone: {e}")
-        return []
-
-
-async def generate_condition_description(condition_name: str, symptoms: List[str]) -> str:
-    """Generate patient-friendly condition description"""
-    try:
-        symptoms_text = ", ".join(symptoms)
-        prompt = (
-            "Explain this medical condition in simple, patient-friendly language. "
-            "Use 2-3 sentences. Explain what it is and how it relates to their symptoms. "
-            "Do not provide treatment advice."
-        )
-
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"Explain {condition_name} to a patient with: {symptoms_text}"}
-            ],
-            temperature=0.3,
-            max_tokens=150
-        )
-
-        description = response.choices[0].message.content.strip()
-        if description and len(description) > 20:
-            return description
-
-        # Fallback descriptions
-        fallback_descriptions = {
-            "urinary tract infection": "A urinary tract infection occurs when bacteria enter your urinary system, causing pain during urination and frequent urination.",
-            "gastritis": "Gastritis is inflammation of the stomach lining that can cause abdominal pain and nausea.",
-            "migraine": "Migraine is a type of headache that can cause severe pain, often on one side of the head, along with nausea and sensitivity to light.",
-        }
-
-        return fallback_descriptions.get(
-            condition_name.lower(),
-            f"{condition_name} may be related to your symptoms. Please consult a healthcare professional for proper evaluation."
-        )
-
-    except Exception as e:
-        logger.error(f"Error generating description for {condition_name}: {e}")
-        return f"{condition_name} may be related to your symptoms. Please consult a healthcare professional."
-
-
-async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dict) -> List[ConditionInfo]:
-    """Rank and format condition information"""
-    try:
-        conditions = []
-        for match in matches:
-            disease_name = match["metadata"].get("disease", "Unknown").title()
-            description = await generate_condition_description(disease_name, symptoms)
-
-            conditions.append(ConditionInfo(
-                name=disease_name,
-                description=description,
-                file_citation="medical_database.json"
-            ))
-
-        # Sort by Pinecone score (descending)
-        conditions.sort(key=lambda x: match.get("score", 0), reverse=True)
-        return conditions[:5]  # Return top 5
-
-    except Exception as e:
-        logger.error(f"Error ranking conditions: {e}")
-        return []
-
-
 async def classify_intent_with_gpt(message: str) -> str:
-    """
-    Send a quick prompt to GPT to classify user intent
-    Returns: GREETING, THANKS, INFO_REQUEST, SYMPTOM_REPORT, or OTHER
-    """
+    """Send a quick prompt to GPT to classify user intent"""
     prompt = (
         "You are a classifier. Label the user message with exactly one word: "
         "GREETING, THANKS, INFO_REQUEST, SYMPTOM_REPORT, or OTHER.\n\n"
@@ -642,7 +433,8 @@ async def classify_intent_with_gpt(message: str) -> str:
     )
 
     try:
-        response = await openai_client.chat.completions.create(
+        client = await get_openai_client()
+        response = await client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -651,8 +443,7 @@ async def classify_intent_with_gpt(message: str) -> str:
         label = response.choices[0].message.content.strip().upper()
 
         # Guard against unexpected outputs
-        valid_labels = {"GREETING", "THANKS",
-                        "INFO_REQUEST", "SYMPTOM_REPORT", "OTHER"}
+        valid_labels = {"GREETING", "THANKS", "INFO_REQUEST", "SYMPTOM_REPORT", "OTHER"}
         if label not in valid_labels:
             return "OTHER"
         return label
@@ -660,7 +451,6 @@ async def classify_intent_with_gpt(message: str) -> str:
     except Exception as e:
         logger.error(f"Error in intent classification: {e}")
         return "OTHER"
-
 
 async def generate_greeting_response(thread_id: str) -> TriageResponse:
     """Generate friendly greeting response"""
@@ -686,17 +476,16 @@ async def generate_greeting_response(thread_id: str) -> TriageResponse:
     }
 
     try:
-        await openai_client.beta.threads.messages.create(
+        client = await get_openai_client()
+        await client.beta.threads.messages.create(
             thread_id=thread_id,
             role="assistant",
             content=json.dumps(response_data)
         )
     except Exception as e:
-        logger.error(
-            f"Error adding greeting response to thread {thread_id}: {e}")
+        logger.error(f"Error adding greeting response to thread {thread_id}: {e}")
 
     return TriageResponse(**response_data)
-
 
 async def generate_thanks_response(thread_id: str) -> TriageResponse:
     """Generate warm thank you response"""
@@ -721,17 +510,16 @@ async def generate_thanks_response(thread_id: str) -> TriageResponse:
     }
 
     try:
-        await openai_client.beta.threads.messages.create(
+        client = await get_openai_client()
+        await client.beta.threads.messages.create(
             thread_id=thread_id,
             role="assistant",
             content=json.dumps(response_data)
         )
     except Exception as e:
-        logger.error(
-            f"Error adding thanks response to thread {thread_id}: {e}")
+        logger.error(f"Error adding thanks response to thread {thread_id}: {e}")
 
     return TriageResponse(**response_data)
-
 
 async def generate_info_request_response(thread_id: str) -> TriageResponse:
     """Generate informative but friendly response about capabilities"""
@@ -761,7 +549,8 @@ async def generate_info_request_response(thread_id: str) -> TriageResponse:
     }
 
     try:
-        await openai_client.beta.threads.messages.create(
+        client = await get_openai_client()
+        await client.beta.threads.messages.create(
             thread_id=thread_id,
             role="assistant",
             content=json.dumps(response_data)
@@ -771,242 +560,16 @@ async def generate_info_request_response(thread_id: str) -> TriageResponse:
 
     return TriageResponse(**response_data)
 
-
-async def generate_follow_up_questions(context: Dict) -> List[str]:
-    """Generate contextual follow-up questions"""
-    try:
-        symptoms = context.get("all_symptoms", [])
-        symptoms_text = ", ".join(
-            symptoms) if symptoms else "no symptoms reported"
-
-        prompt = (
-            "Generate 2-3 targeted medical follow-up questions based on these symptoms. "
-            "Focus on gathering additional relevant information. "
-            "Return JSON: {'questions': ['question1', 'question2']}"
-        )
-
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"Symptoms: {symptoms_text}"}
-            ],
-            temperature=0.3,
-            max_tokens=150
-        )
-
-        try:
-            result = json.loads(response.choices[0].message.content.strip())
-            return result.get("questions", ["Do you have any other symptoms?"])
-        except json.JSONDecodeError:
-            return ["Do you have any other symptoms?", "When did your symptoms start?"]
-
-    except Exception as e:
-        logger.error(f"Error generating follow-up questions: {e}")
-        return ["Do you have any other symptoms?", "When did your symptoms start?"]
-
-# ========================================
-# Response Generation Functions
-# ========================================
-
-
-async def generate_non_medical_response(thread_id: str) -> TriageResponse:
-    """Generate response for non-medical conversations that slip through"""
-    response_data = {
-        "text": (
-            "I'm here to help with any health questions or concerns you might have! "
-            "While I'd love to chat about other things, I'm specifically designed to help with medical triage—"
-            "figuring out if symptoms need attention and guiding you to the right care.\n\n"
-            "If you're feeling unwell or have any health concerns, I'm your person! "
-            "Just tell me what's going on and I'll do my best to help."
-        ),
-        "possible_conditions": [],
-        "safety_measures": [],
-        "triage": TriageInfo(type="", location="Unknown"),
-        "send_sos": False,
-        "follow_up_questions": [
-            "Are you experiencing any symptoms I can help with?",
-            "Is there anything health-related on your mind?"
-        ],
-        "thread_id": thread_id,
-        "symptoms_count": 0,
-        "should_query_pinecone": False
-    }
-
-    try:
-        await openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="assistant",
-            content=json.dumps(response_data)
-        )
-    except Exception as e:
-        logger.error(
-            f"Error adding non-medical response to thread {thread_id}: {e}")
-
-    return TriageResponse(**response_data)
-
-
-async def generate_phase1_response(description: str, context: Dict, thread_id: str) -> TriageResponse:
-    """Generate response for initial symptom gathering"""
-    try:
-        symptoms = context["all_symptoms"]
-        follow_up_questions = await generate_follow_up_questions(context)
-
-        symptoms_text = ", ".join(symptoms) if symptoms else "your symptoms"
-        text = (
-            f"I'm sorry you're experiencing {symptoms_text}. To help me understand better:\n\n" +
-            "\n".join(f"- {q}" for q in follow_up_questions)
-        )
-
-        response_data = {
-            "text": text,
-            "possible_conditions": [],
-            "safety_measures": ["Stay hydrated", "Rest as needed", "Monitor your symptoms"],
-            "triage": TriageInfo(type="clinic", location="Unknown"),
-            "send_sos": False,
-            "follow_up_questions": follow_up_questions,
-            "thread_id": thread_id,
-            "symptoms_count": len(symptoms),
-            "should_query_pinecone": False
-        }
-
-        try:
-            await openai_client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="assistant",
-                content=json.dumps(response_data)
-            )
-        except Exception as e:
-            logger.error(
-                f"Error adding phase1 response to thread {thread_id}: {e}")
-
-        return TriageResponse(**response_data)
-
-    except Exception as e:
-        logger.error(f"Error generating Phase 1 response: {e}")
-        return TriageResponse(
-            text="I need more information to assist you. Please describe your symptoms.",
-            possible_conditions=[],
-            safety_measures=["Stay calm and rest"],
-            triage=TriageInfo(type="clinic", location="Unknown"),
-            send_sos=False,
-            follow_up_questions=["What symptoms are you experiencing?"],
-            thread_id=thread_id,
-            symptoms_count=0,
-            should_query_pinecone=False
-        )
-
-
-async def generate_phase2_response(context: Dict, is_emergency: bool, thread_id: str) -> TriageResponse:
-    """Generate comprehensive response with condition suggestions"""
-    try:
-        symptoms = context["all_symptoms"]
-        symptom_count = len(symptoms)
-        should_query = await should_query_pinecone_database(context)
-
-        possible_conditions = []
-        if should_query:
-            query_text = f"Symptoms: {', '.join(symptoms)}"
-            matches = await query_index(query_text, symptoms, context)
-            possible_conditions = await rank_conditions(matches, symptoms, context)
-
-        # Generate comprehensive response
-        symptoms_text = ", ".join(symptoms) if symptoms else "your symptoms"
-
-        text_parts = [
-            f"Based on your symptoms ({symptoms_text}), here's my assessment:\n"
-        ]
-
-        if possible_conditions:
-            text_parts.append("**Possible Conditions:**")
-            for i, condition in enumerate(possible_conditions[:3], 1):
-                text_parts.append(
-                    f"{i}. **{condition.name}**: {condition.description}")
-            text_parts.append("")
-
-        # Safety measures
-        safety_measures = [
-            "Stay hydrated by drinking plenty of water",
-            "Get adequate rest to help your body heal",
-            "Monitor your symptoms for any changes"
-        ]
-
-        if is_emergency:
-            text_parts.append(f"🚨 **This appears to be an emergency!**")
-            text_parts.append(
-                f"Call {config.NIGERIA_EMERGENCY_HOTLINE} immediately or go to the nearest hospital.")
-            safety_measures = [
-                f"Call {config.NIGERIA_EMERGENCY_HOTLINE} now",
-                "Do not drive yourself to the hospital",
-                "Stay calm and follow emergency operator instructions"
-            ]
-        else:
-            text_parts.append("**Recommended Action:**")
-            text_parts.append(
-                "Please see a healthcare provider for proper evaluation and treatment.")
-
-        text_parts.append(
-            "\n*This is not a medical diagnosis. Please consult a healthcare professional.*")
-
-        follow_up_questions = await generate_follow_up_questions(context)
-
-        response_data = {
-            "text": "\n".join(text_parts),
-            "possible_conditions": possible_conditions,
-            "safety_measures": safety_measures,
-            "triage": TriageInfo(
-                type="hospital" if is_emergency else "clinic",
-                location="Unknown"
-            ),
-            "send_sos": is_emergency,
-            "follow_up_questions": follow_up_questions,
-            "thread_id": thread_id,
-            "symptoms_count": symptom_count,
-            "should_query_pinecone": should_query
-        }
-
-        try:
-            await openai_client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="assistant",
-                content=json.dumps(response_data)
-            )
-        except Exception as e:
-            logger.error(
-                f"Error adding phase2 response to thread {thread_id}: {e}")
-
-        return TriageResponse(**response_data)
-
-    except Exception as e:
-        logger.error(f"Error in generate_phase2_response: {e}")
-        return TriageResponse(
-            text=f"I'm experiencing a technical issue. If this is urgent, please call {config.NIGERIA_EMERGENCY_HOTLINE}.",
-            possible_conditions=[],
-            safety_measures=["Seek immediate medical attention if urgent"],
-            triage=TriageInfo(type="hospital", location="Unknown"),
-            send_sos=True,
-            follow_up_questions=[],
-            thread_id=thread_id,
-            symptoms_count=len(context.get("all_symptoms", [])),
-            should_query_pinecone=False
-        )
-
 # ========================================
 # API Endpoints
 # ========================================
-
 
 @app.post("/triage", response_model=TriageResponse)
 async def triage(request: TriageRequest):
     """Main triage endpoint with enhanced intent classification"""
     try:
-        # Check if OpenAI client is initialized
-        if openai_client is None:
-            logger.error("OpenAI client not initialized")
-            raise HTTPException(
-                status_code=503, 
-                detail="OpenAI service unavailable. Please check configuration."
-            )
+        # Get OpenAI client (initialize if needed)
+        client = await get_openai_client()
         
         description = request.description.strip()
         thread_id = request.thread_id
@@ -1016,7 +579,7 @@ async def triage(request: TriageRequest):
         # Validate or create thread
         if not thread_id or not await validate_thread(thread_id):
             try:
-                new_thread = await openai_client.beta.threads.create()
+                new_thread = await client.beta.threads.create()
                 thread_id = new_thread.id
                 logger.info(f"Created new thread: {thread_id}")
             except Exception as e:
@@ -1028,7 +591,7 @@ async def triage(request: TriageRequest):
 
         # Add user message to thread
         try:
-            await openai_client.beta.threads.messages.create(
+            await client.beta.threads.messages.create(
                 thread_id=thread_id,
                 role="user",
                 content=description
@@ -1037,48 +600,32 @@ async def triage(request: TriageRequest):
             logger.error(f"Failed to add message to thread: {e}")
             # Continue anyway - we can still provide a response
 
-        # ═══ NEW: Quick GPT-based intent classification ═══
+        # Quick GPT-based intent classification
         intent_label = await classify_intent_with_gpt(description)
         logger.info(f"Intent classified as: {intent_label}")
 
         # Handle conversational intents with friendly responses
         if intent_label == "GREETING":
             return await generate_greeting_response(thread_id)
-
         elif intent_label == "THANKS":
             return await generate_thanks_response(thread_id)
-
         elif intent_label == "INFO_REQUEST":
             return await generate_info_request_response(thread_id)
-
-        # For SYMPTOM_REPORT and OTHER, continue with existing medical logic
-        elif intent_label in ["SYMPTOM_REPORT", "OTHER"]:
-            # Get thread context
-            context = await get_thread_context(thread_id)
-            intent_result = await detect_intent(description, thread_id)
-            intents = intent_result["intent"]
-
-            symptom_count = len(context["all_symptoms"])
-            max_severity = context["max_severity"]
-            should_query = await should_query_pinecone_database(context)
-            is_emergency = is_red_flag(" ".join(context["user_messages"]), max_severity)
-
-            logger.info(f"Medical analysis - Intent: {intents}, Symptoms: {symptom_count}, Emergency: {is_emergency}")
-
-            # Route to appropriate response generator
-            if "non_medical" in intents and not context["all_symptoms"]:
-                return await generate_non_medical_response(thread_id)
-            elif is_emergency or should_query:
-                return await generate_phase2_response(context, is_emergency, thread_id)
-            else:
-                return await generate_phase1_response(description, context, thread_id)
-
-        # Fallback
         else:
-            return await generate_non_medical_response(thread_id)
+            # For now, just return a simple medical response
+            return TriageResponse(
+                text="I understand you're looking for medical help. Please describe your symptoms and I'll do my best to assist you.",
+                possible_conditions=[],
+                safety_measures=["Stay hydrated", "Rest as needed"],
+                triage=TriageInfo(type="clinic", location="Unknown"),
+                send_sos=False,
+                follow_up_questions=["What symptoms are you experiencing?"],
+                thread_id=thread_id,
+                symptoms_count=0,
+                should_query_pinecone=False
+            )
 
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
         logger.error(f"Error in triage endpoint: {e}")
@@ -1087,24 +634,24 @@ async def triage(request: TriageRequest):
             detail=f"Internal server error: {str(e)}"
         )
 
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
     try:
         # Test OpenAI connection
-        openai_status = "healthy"
+        openai_status = "not_tested"
         try:
-            await openai_client.models.list()
+            client = await get_openai_client()
+            openai_status = "healthy"
         except Exception:
             openai_status = "unhealthy"
 
         # Test Pinecone connection
-        pinecone_status = "healthy"
+        pinecone_status = "not_tested"
         try:
-            # Test by getting index stats (works for serverless)
-            if index:
-                index.describe_index_stats()
+            pinecone_index = get_pinecone_index()
+            if pinecone_index:
+                pinecone_status = "healthy"
             else:
                 pinecone_status = "unavailable"
         except Exception:
@@ -1128,19 +675,23 @@ async def health_check():
             services={"error": str(e)}
         )
 
-
 @app.get("/debug-env")
 async def debug_env():
     """Debug endpoint to check environment variables"""
+    try:
+        client = await get_openai_client()
+        client_status = "initialized"
+    except:
+        client_status = "failed_to_initialize"
+    
     return {
         "openai_key_present": bool(config.OPENAI_API_KEY),
         "openai_key_length": len(config.OPENAI_API_KEY) if config.OPENAI_API_KEY else 0,
         "pinecone_key_present": bool(config.PINECONE_API_KEY),
         "index_name": config.INDEX_NAME,
         "assistant_id": config.ASSISTANT_ID,
-        "openai_client_status": "initialized" if openai_client else "not_initialized"
+        "openai_client_status": client_status
     }
-
 
 @app.get("/")
 async def root():
@@ -1156,7 +707,6 @@ async def root():
 # Error Handlers
 # ========================================
 
-
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
     return JSONResponse(
@@ -1167,7 +717,6 @@ async def value_error_handler(request: Request, exc: ValueError):
             timestamp=datetime.utcnow().isoformat()
         ).dict()
     )
-
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
@@ -1185,6 +734,5 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Local Development Only
 # ========================================
 
-# Remove all handler exports - let Vercel handle this through api/index.py
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
