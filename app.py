@@ -218,6 +218,8 @@ async def get_thread_context(thread_id: str, client=None) -> Dict:
         if client is None:
             client = await client_manager.get_openai_client()
             
+        logger.info(f"📚 Retrieving context for thread: {thread_id}")
+        
         messages = await client.beta.threads.messages.list(
             thread_id=thread_id,
             order='asc',
@@ -227,29 +229,50 @@ async def get_thread_context(thread_id: str, client=None) -> Dict:
         user_messages = []
         all_symptoms = []
         max_severity = 0
+        
+        logger.info(f"📊 Found {len(messages.data)} total messages in thread")
 
-        for msg in messages.data:
+        for i, msg in enumerate(messages.data):
             if msg.role == "user":
                 content = ""
                 if msg.content and hasattr(msg.content[0], "text"):
                     content = msg.content[0].text.value
                 if content:
                     user_messages.append(content)
-                    symptom_data = await extract_symptoms_comprehensive(content, client)
-                    all_symptoms.extend(symptom_data["symptoms"])
-                    max_severity = max(max_severity, symptom_data["severity"])
+                    logger.info(f"👤 User message {i+1}: '{content[:50]}...'")
+                    
+                    try:
+                        symptom_data = await extract_symptoms_comprehensive(content, client)
+                        extracted_symptoms = symptom_data["symptoms"]
+                        severity = symptom_data["severity"]
+                        
+                        logger.info(f"🩺 Extracted from message {i+1}: {extracted_symptoms} (severity: {severity})")
+                        
+                        all_symptoms.extend(extracted_symptoms)
+                        max_severity = max(max_severity, severity)
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Failed to extract symptoms from message {i+1}: {e}")
 
         # Deduplicate symptoms
         unique_symptoms = list(dict.fromkeys([s.lower().strip() for s in all_symptoms if s.strip()]))
-
-        return {
+        
+        context = {
             "user_messages": user_messages,
             "all_symptoms": unique_symptoms,
             "max_severity": max_severity
         }
+        
+        logger.info(f"📋 Thread context summary:")
+        logger.info(f"   - User messages: {len(user_messages)}")
+        logger.info(f"   - Raw symptoms extracted: {all_symptoms}")
+        logger.info(f"   - Unique symptoms: {unique_symptoms}")
+        logger.info(f"   - Max severity: {max_severity}")
+        
+        return context
 
     except Exception as e:
-        logger.error(f"Error retrieving thread context for {thread_id}: {e}")
+        logger.error(f"❌ Error retrieving thread context for {thread_id}: {e}")
         return {"user_messages": [], "all_symptoms": [], "max_severity": 0}
 
 async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
@@ -258,6 +281,8 @@ async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
         if client is None:
             client = await client_manager.get_openai_client()
         description_lower = description.lower()
+
+        logger.info(f"🔍 Extracting symptoms from: '{description[:100]}...'")
 
         # Extract severity
         severity = 0
@@ -269,17 +294,19 @@ async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
         for term, score in descriptive_severity.items():
             if term in description_lower:
                 severity = score
+                logger.info(f"📊 Found severity indicator '{term}': {score}")
                 break
 
         # Check for numeric pain scale
         pain_scale_match = re.search(r"pain\s+(\d+)/10", description_lower)
         if pain_scale_match:
             severity = int(pain_scale_match.group(1))
+            logger.info(f"📊 Found numeric pain scale: {severity}/10")
 
         # Extract symptoms using GPT
         prompt = (
             "Extract specific medical symptoms from this text. Return a JSON array of symptom strings. "
-            "Be precise and use standard medical terminology. "
+            "Be precise and use standard medical terminology. Focus on physical symptoms only. "
             "Example: [\"chest pain\", \"shortness of breath\", \"nausea\"]\n\n"
             f"Text: \"{description}\""
         )
@@ -290,24 +317,33 @@ async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "Extract symptoms now."}
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=200
         )
 
         try:
             symptoms = json.loads(response.choices[0].message.content.strip())
             if not isinstance(symptoms, list):
+                logger.warning(f"⚠️ GPT returned non-list: {symptoms}")
                 symptoms = []
-        except json.JSONDecodeError:
-            logger.warning("GPT returned invalid JSON for symptoms")
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ GPT returned invalid JSON: {response.choices[0].message.content}")
             symptoms = []
 
         # Clean and deduplicate symptoms
-        unique_symptoms = list(dict.fromkeys([s.lower().strip() for s in symptoms if s.strip()]))
+        unique_symptoms = []
+        for symptom in symptoms:
+            if isinstance(symptom, str) and symptom.strip():
+                clean_symptom = symptom.lower().strip()
+                if clean_symptom not in [s.lower() for s in unique_symptoms]:
+                    unique_symptoms.append(clean_symptom)
 
-        return {"symptoms": unique_symptoms, "severity": severity}
+        result = {"symptoms": unique_symptoms, "severity": severity}
+        logger.info(f"✅ Extraction result: {result}")
+        return result
 
     except Exception as e:
-        logger.error(f"Error extracting symptoms: {e}")
+        logger.error(f"❌ Error extracting symptoms: {e}")
         return {"symptoms": [], "severity": 0}
 
 def is_red_flag(text: str, severity: int = 0) -> bool:
@@ -795,6 +831,78 @@ async def triage(request: TriageRequest):
             thread_id=thread_id or "error",
             symptoms_count=0,
             should_query_pinecone=False
+        )
+
+@app.get("/debug/thread/{thread_id}")
+async def debug_thread(thread_id: str):
+    """Debug endpoint to inspect thread contents"""
+    try:
+        logger.info(f"🔍 Debugging thread: {thread_id}")
+        client = await client_manager.get_openai_client()
+        
+        # Get all messages from the thread
+        messages = await client.beta.threads.messages.list(
+            thread_id=thread_id,
+            order='asc',
+            limit=100
+        )
+        
+        debug_info = {
+            "thread_id": thread_id,
+            "total_messages": len(messages.data),
+            "messages": []
+        }
+        
+        all_symptoms = []
+        max_severity = 0
+        
+        for i, msg in enumerate(messages.data):
+            message_info = {
+                "index": i,
+                "role": msg.role,
+                "timestamp": msg.created_at,
+                "content": ""
+            }
+            
+            if msg.content and len(msg.content) > 0:
+                if hasattr(msg.content[0], "text"):
+                    content = msg.content[0].text.value
+                    message_info["content"] = content[:200] + "..." if len(content) > 200 else content
+                    
+                    # Extract symptoms from user messages
+                    if msg.role == "user":
+                        try:
+                            symptom_data = await extract_symptoms_comprehensive(content, client)
+                            message_info["extracted_symptoms"] = symptom_data["symptoms"]
+                            message_info["severity"] = symptom_data["severity"]
+                            all_symptoms.extend(symptom_data["symptoms"])
+                            max_severity = max(max_severity, symptom_data["severity"])
+                        except Exception as e:
+                            message_info["symptom_extraction_error"] = str(e)
+            
+            debug_info["messages"].append(message_info)
+        
+        # Deduplicate symptoms
+        unique_symptoms = list(dict.fromkeys([s.lower().strip() for s in all_symptoms if s.strip()]))
+        
+        debug_info["summary"] = {
+            "unique_symptoms": unique_symptoms,
+            "symptom_count": len(unique_symptoms),
+            "max_severity": max_severity,
+            "should_query_pinecone": len(unique_symptoms) >= config.MIN_SYMPTOMS_FOR_PINECONE
+        }
+        
+        return debug_info
+        
+    except Exception as e:
+        logger.error(f"❌ Debug thread failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "thread_id": thread_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
         )
 
 @app.get("/test-openai")
