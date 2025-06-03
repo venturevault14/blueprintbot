@@ -41,7 +41,7 @@ class Config:
         self.MIN_SYMPTOMS_FOR_PINECONE = int(os.getenv("MIN_SYMPTOMS_FOR_PINECONE", "3"))
         self.MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "3"))
         self.NIGERIA_EMERGENCY_HOTLINE = os.getenv("EMERGENCY_HOTLINE", "112")
-        self.PINECONE_SCORE_THRESHOLD = float(os.getenv("PINECONE_SCORE_THRESHOLD", "0.8"))
+        self.PINECONE_SCORE_THRESHOLD = float(os.getenv("PINECONE_SCORE_THRESHOLD", "0.88"))  # Updated to 0.88
         self.PORT = int(os.getenv("PORT", "8000"))
 
     def validate(self):
@@ -672,9 +672,49 @@ async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k
         matches = response.get("matches", [])
         logger.info(f"Pinecone returned {len(matches)} matches")
 
-        # Filter by score threshold
+        # Filter by score threshold (using 0.88 as requested)
         filtered_matches = [
             match for match in matches 
+            if match.get("score", 0) >= config.PINECONE_SCORE_THRESHOLD
+        ]
+        
+        logger.info(f"✅ Selected {len(filtered_matches)} conditions after filtering (score >= {config.PINECONE_SCORE_THRESHOLD})")
+        return filtered_matches
+
+    except Exception as e:
+        logger.error(f"❌ Error querying index: {e}")
+        return []
+
+async def query_treatment_index(symptoms: List[str], context: Dict, top_k: int = 5) -> List[Dict]:
+    """Query Pinecone treatment index for Q&A snippets"""
+    try:
+        # Get treatment index
+        treatment_index = client_manager.get_treatment_index()
+        if not treatment_index:
+            logger.warning("Treatment index not available")
+            return []
+        
+        # Create query text from symptoms
+        symptoms_text = ", ".join(symptoms)
+        query_text = f"I have {symptoms_text} - what should I do?"
+        
+        logger.info(f"💊 Querying treatment index with: {query_text}")
+        
+        # Get embeddings using secondary client
+        query_embedding = await get_treatment_embeddings([query_text])
+        
+        response = treatment_index.query(
+            vector=query_embedding[0],
+            top_k=top_k,
+            include_metadata=True
+        )
+
+        matches = response.get("matches", [])
+        logger.info(f"📊 Treatment index returned {len(matches)} matches")
+
+        # Filter by score threshold (can be lower for treatment as they're more specific)
+        filtered_matches = [
+            match for match in matches
             if match.get("score", 0) >= 0.7  # Lower threshold for treatment
         ]
         
@@ -719,13 +759,14 @@ async def generate_condition_description(condition_name: str, symptoms: List[str
         return f"{condition_name} may be related to your symptoms. Please consult a healthcare professional."
 
 async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dict) -> List[ConditionInfo]:
-    """Rank and format condition information - FIXED to remove duplicates"""
+    """Rank and format condition information - Show ALL conditions that meet score threshold"""
     try:
         conditions = []
         seen_diseases = set()  # Track unique disease names
         
-        for match in matches[:10]:  # Check more matches to get variety
+        for match in matches:  # Process ALL matches that already passed score filter
             disease_name = match["metadata"].get("disease", "Unknown").title()
+            score = match.get("score", 0)
             
             # Skip duplicates
             if disease_name in seen_diseases:
@@ -740,11 +781,9 @@ async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dic
                 file_citation="medical_database.json"
             ))
             
-            # Stop when we have 3-5 unique conditions
-            if len(conditions) >= 5:
-                break
+            logger.info(f"✅ Added condition: {disease_name} (score: {score:.3f})")
 
-        logger.info(f"✅ Ranked {len(conditions)} unique conditions: {[c.name for c in conditions]}")
+        logger.info(f"✅ Ranked {len(conditions)} unique conditions meeting threshold: {[c.name for c in conditions]}")
         return conditions
 
     except Exception as e:
@@ -752,7 +791,7 @@ async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dic
         return []
 
 async def synthesize_treatment_advice(treatment_matches: List[Dict], symptoms: List[str], context: Dict) -> str:
-    """Use GPT to synthesize treatment Q&A snippets into cohesive advice - SIMPLE FIX"""
+    """Use GPT to synthesize treatment Q&A snippets into cohesive advice"""
     try:
         client = await client_manager.get_openai_client_2()
         
@@ -1084,10 +1123,10 @@ async def generate_conversational_response(context: Dict, is_emergency: bool, th
             text_parts = [
                 f"Thank you for sharing all that information with me. Based on your symptoms - {symptoms_text} - I can see why you're concerned.",
                 "",
-                "Here are some conditions that could potentially match what you're experiencing:"
+                "Here are the conditions that could potentially match what you're experiencing:"
             ]
             
-            for i, condition in enumerate(possible_conditions[:3], 1):
+            for i, condition in enumerate(possible_conditions, 1):
                 text_parts.append(f"**{i}. {condition.name}**")
                 text_parts.append(f"   {condition.description}")
                 text_parts.append("")
@@ -1569,51 +1608,4 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 # Export for Vercel
-handler = app 
-            if match.get("score", 0) >= config.PINECONE_SCORE_THRESHOLD
-        ]
-        
-        # Log unique diseases found
-        unique_diseases = set()
-        for match in filtered_matches:
-            disease = match["metadata"].get("disease", "Unknown")
-            unique_diseases.add(disease)
-        
-        logger.info(f"📊 Found {len(unique_diseases)} unique diseases: {list(unique_diseases)[:5]}...")
-
-        return filtered_matches
-
-    except Exception as e:
-        logger.error(f"Error querying Pinecone: {e}")
-        return []
-
-async def query_treatment_index(symptoms: List[str], context: Dict, top_k: int = 5) -> List[Dict]:
-    """Query Pinecone treatment index for Q&A snippets"""
-    try:
-        # Get treatment index
-        treatment_index = client_manager.get_treatment_index()
-        if not treatment_index:
-            logger.warning("Treatment index not available")
-            return []
-        
-        # Create query text from symptoms
-        symptoms_text = ", ".join(symptoms)
-        query_text = f"I have {symptoms_text} - what should I do?"
-        
-        logger.info(f"💊 Querying treatment index with: {query_text}")
-        
-        # Get embeddings using secondary client
-        query_embedding = await get_treatment_embeddings([query_text])
-        
-        response = treatment_index.query(
-            vector=query_embedding[0],
-            top_k=top_k,
-            include_metadata=True
-        )
-
-        matches = response.get("matches", [])
-        logger.info(f"📊 Treatment index returned {len(matches)} matches")
-
-        # Filter by score threshold (can be lower for treatment as they're more specific)
-        filtered_matches = [
-            match for match in matches
+handler = app
