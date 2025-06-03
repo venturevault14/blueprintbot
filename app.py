@@ -275,6 +275,38 @@ async def get_thread_context(thread_id: str, client=None) -> Dict:
         logger.error(f"❌ Error retrieving thread context for {thread_id}: {e}")
         return {"user_messages": [], "all_symptoms": [], "max_severity": 0}
 
+def extract_symptoms_fallback(text: str) -> List[str]:
+    """Fallback keyword-based symptom extraction"""
+    text_lower = text.lower()
+    symptoms = []
+    
+    # Common symptom keywords
+    symptom_patterns = {
+        "headache": ["headache", "head pain", "migraine"],
+        "nausea": ["nausea", "nauseous", "feeling sick", "sick to stomach"],
+        "fever": ["fever", "temperature", "hot", "feverish"],
+        "cough": ["cough", "coughing"],
+        "sore throat": ["sore throat", "throat pain", "throat hurts"],
+        "stomach pain": ["stomach pain", "stomach ache", "abdominal pain", "belly pain"],
+        "diarrhea": ["diarrhea", "loose stool", "watery stool"],
+        "constipation": ["constipation", "not stooling", "can't poop", "no bowel movement"],
+        "vomiting": ["vomiting", "throwing up", "vomit"],
+        "dizziness": ["dizzy", "dizziness", "lightheaded"],
+        "fatigue": ["tired", "fatigue", "exhausted", "weak"],
+        "chest pain": ["chest pain", "chest hurts"],
+        "shortness of breath": ["shortness of breath", "hard to breathe", "can't breathe"],
+        "back pain": ["back pain", "backache"],
+        "joint pain": ["joint pain", "joints hurt"],
+        "runny nose": ["runny nose", "stuffy nose", "congestion"],
+        "sour taste": ["sour taste", "bitter taste", "metallic taste"]
+    }
+    
+    for symptom, patterns in symptom_patterns.items():
+        if any(pattern in text_lower for pattern in patterns):
+            symptoms.append(symptom)
+    
+    return symptoms
+
 async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
     """Extract symptoms, duration, and severity from description"""
     try:
@@ -305,8 +337,9 @@ async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
 
         # Extract symptoms using GPT
         prompt = (
-            "Extract specific medical symptoms from this text. Return a JSON array of symptom strings. "
+            "Extract specific medical symptoms from this text. Return ONLY a JSON array of symptom strings. "
             "Be precise and use standard medical terminology. Focus on physical symptoms only. "
+            "Do NOT wrap in markdown code blocks. Return raw JSON only. "
             "Example: [\"chest pain\", \"shortness of breath\", \"nausea\"]\n\n"
             f"Text: \"{description}\""
         )
@@ -322,13 +355,44 @@ async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
         )
 
         try:
-            symptoms = json.loads(response.choices[0].message.content.strip())
+            raw_response = response.choices[0].message.content.strip()
+            logger.info(f"🤖 GPT raw response: {raw_response[:100]}...")
+            
+            # Handle markdown code blocks
+            if raw_response.startswith("```json"):
+                # Extract JSON from markdown code block
+                json_start = raw_response.find('[')
+                json_end = raw_response.rfind(']') + 1
+                if json_start != -1 and json_end > json_start:
+                    json_str = raw_response[json_start:json_end]
+                    logger.info(f"🔧 Extracted JSON from markdown: {json_str}")
+                else:
+                    logger.warning("⚠️ Could not extract JSON from markdown block")
+                    json_str = "[]"
+            elif raw_response.startswith("```"):
+                # Handle other code block formats
+                lines = raw_response.split('\n')
+                json_lines = [line for line in lines if line.strip() and not line.startswith('```')]
+                json_str = '\n'.join(json_lines)
+                logger.info(f"🔧 Extracted JSON from code block: {json_str}")
+            else:
+                json_str = raw_response
+            
+            symptoms = json.loads(json_str)
             if not isinstance(symptoms, list):
                 logger.warning(f"⚠️ GPT returned non-list: {symptoms}")
                 symptoms = []
+            else:
+                logger.info(f"✅ Successfully parsed {len(symptoms)} symptoms")
+                
         except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ GPT returned invalid JSON: {response.choices[0].message.content}")
-            symptoms = []
+            logger.warning(f"⚠️ JSON parsing failed: {e}")
+            logger.warning(f"⚠️ Raw content: {raw_response}")
+            
+            # Fallback: try to extract symptoms using keyword matching
+            logger.info("🔄 Falling back to keyword-based symptom extraction")
+            symptoms = extract_symptoms_fallback(description)
+            logger.info(f"🔄 Fallback extracted: {symptoms}")
 
         # Clean and deduplicate symptoms
         unique_symptoms = []
