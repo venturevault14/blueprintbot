@@ -650,7 +650,7 @@ async def get_treatment_embeddings(texts: List[str]) -> List[List[float]]:
     raise HTTPException(status_code=503, detail="Failed to generate treatment embeddings")
 
 async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k: int = 50) -> List[Dict]:
-    """Query Pinecone index for medical conditions"""
+    """Query Pinecone index for medical conditions - IMPROVED for variety"""
     try:
         pinecone_index = client_manager.get_pinecone_index()
         if not pinecone_index:
@@ -662,6 +662,7 @@ async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k
             logger.error("Failed to generate query embedding")
             return []
 
+        # Query with more results to get variety
         response = pinecone_index.query(
             vector=query_embedding[0],
             top_k=top_k,
@@ -672,45 +673,6 @@ async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k
         logger.info(f"Pinecone returned {len(matches)} matches")
 
         # Filter by score threshold
-        filtered_matches = [
-            match for match in matches 
-            if match.get("score", 0) >= config.PINECONE_SCORE_THRESHOLD
-        ]
-
-        return filtered_matches
-
-    except Exception as e:
-        logger.error(f"Error querying Pinecone: {e}")
-        return []
-
-async def query_treatment_index(symptoms: List[str], context: Dict, top_k: int = 5) -> List[Dict]:
-    """Query Pinecone treatment index for Q&A snippets"""
-    try:
-        # Get treatment index
-        treatment_index = client_manager.get_treatment_index()
-        if not treatment_index:
-            logger.warning("Treatment index not available")
-            return []
-        
-        # Create query text from symptoms
-        symptoms_text = ", ".join(symptoms)
-        query_text = f"I have {symptoms_text} - what should I do?"
-        
-        logger.info(f"💊 Querying treatment index with: {query_text}")
-        
-        # Get embeddings using secondary client
-        query_embedding = await get_treatment_embeddings([query_text])
-        
-        response = treatment_index.query(
-            vector=query_embedding[0],
-            top_k=top_k,
-            include_metadata=True
-        )
-
-        matches = response.get("matches", [])
-        logger.info(f"📊 Treatment index returned {len(matches)} matches")
-
-        # Filter by score threshold (can be lower for treatment as they're more specific)
         filtered_matches = [
             match for match in matches 
             if match.get("score", 0) >= 0.7  # Lower threshold for treatment
@@ -757,11 +719,19 @@ async def generate_condition_description(condition_name: str, symptoms: List[str
         return f"{condition_name} may be related to your symptoms. Please consult a healthcare professional."
 
 async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dict) -> List[ConditionInfo]:
-    """Rank and format condition information"""
+    """Rank and format condition information - FIXED to remove duplicates"""
     try:
         conditions = []
-        for match in matches[:5]:  # Top 5 only
+        seen_diseases = set()  # Track unique disease names
+        
+        for match in matches[:10]:  # Check more matches to get variety
             disease_name = match["metadata"].get("disease", "Unknown").title()
+            
+            # Skip duplicates
+            if disease_name in seen_diseases:
+                continue
+                
+            seen_diseases.add(disease_name)
             description = await generate_condition_description(disease_name, symptoms)
 
             conditions.append(ConditionInfo(
@@ -769,7 +739,12 @@ async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dic
                 description=description,
                 file_citation="medical_database.json"
             ))
+            
+            # Stop when we have 3-5 unique conditions
+            if len(conditions) >= 5:
+                break
 
+        logger.info(f"✅ Ranked {len(conditions)} unique conditions: {[c.name for c in conditions]}")
         return conditions
 
     except Exception as e:
@@ -777,43 +752,55 @@ async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dic
         return []
 
 async def synthesize_treatment_advice(treatment_matches: List[Dict], symptoms: List[str], context: Dict) -> str:
-    """Use GPT to synthesize treatment Q&A snippets into cohesive advice"""
+    """Use GPT to synthesize treatment Q&A snippets into cohesive advice - SIMPLE FIX"""
     try:
         client = await client_manager.get_openai_client_2()
         
-        # Extract Q&A content from matches
+        # Extract Q&A content directly from Pinecone metadata
         qa_snippets = []
-        for match in treatment_matches:
+        
+        logger.info(f"🔍 Processing {len(treatment_matches)} treatment matches...")
+        
+        for i, match in enumerate(treatment_matches):
             metadata = match.get("metadata", {})
-            # Assuming metadata contains 'question' and 'answer' fields
-            question = metadata.get("question", "")
-            answer = metadata.get("answer", "")
-            if question and answer:
-                qa_snippets.append(f"Q: {question}\nA: {answer}")
+            
+            # Debug: Log what we actually get from Pinecone
+            logger.info(f"📋 Match {i+1} metadata keys: {list(metadata.keys())}")
+            
+            # Your data has the Q&A text in metadata["text"]
+            if "text" in metadata:
+                qa_text = metadata["text"]
+                qa_snippets.append(qa_text)
+                logger.info(f"✅ Match {i+1}: Found Q&A text ({len(qa_text)} chars)")
+                logger.info(f"📝 Preview: {qa_text[:100]}...")
+            else:
+                logger.warning(f"⚠️ Match {i+1}: No 'text' field in metadata")
+                # Log the full metadata structure for debugging
+                logger.info(f"📋 Full metadata: {metadata}")
         
         if not qa_snippets:
-            logger.warning("No Q&A snippets found in treatment matches")
+            logger.error("❌ No Q&A snippets extracted from treatment matches")
             return "I recommend consulting with a healthcare provider for personalized treatment advice."
         
+        logger.info(f"✅ Successfully extracted {len(qa_snippets)} Q&A snippets")
+        
+        # Create prompt for GPT
         symptoms_text = ", ".join(symptoms)
         
         prompt = (
-            "You are a medical assistant synthesizing treatment advice. "
-            "Below are several Q&A excerpts about treatment for symptoms similar to what the patient is experiencing. "
-            "Create ONE clear, cohesive, step-by-step set of recommendations. "
-            "Focus on immediate actions, self-care measures, and when to seek professional help. "
-            "Be practical and actionable. Do not repeat the same advice multiple times.\n\n"
+            "You are a medical assistant. Below are Q&A excerpts from a medical database "
+            "that match the patient's symptoms. Create ONE unified set of treatment recommendations.\n\n"
             f"Patient's symptoms: {symptoms_text}\n\n"
-            "Treatment Q&A excerpts:\n"
-            + "\n\n".join(qa_snippets) +
-            "\n\nProvide a unified treatment plan:"
+            "Relevant Q&A excerpts:\n\n"
+            + "\n\n---\n\n".join(qa_snippets) +
+            "\n\nBased on these excerpts, provide unified treatment recommendations:"
         )
         
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Please provide the unified treatment recommendations."}
+                {"role": "system", "content": "You are a helpful medical assistant providing treatment guidance."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.3,
             max_tokens=400
@@ -826,7 +813,7 @@ async def synthesize_treatment_advice(treatment_matches: List[Dict], symptoms: L
         
     except Exception as e:
         logger.error(f"❌ Error synthesizing treatment advice: {e}")
-        return "I recommend consulting with a healthcare provider for personalized treatment advice based on your specific symptoms."
+        return "I recommend consulting with a healthcare provider for personalized treatment advice."
 
 async def generate_follow_up_questions(context: Dict, client=None) -> List[str]:
     """Generate contextual follow-up questions based on symptoms and conversation stage"""
@@ -1369,6 +1356,63 @@ async def debug_treatment_index():
             }
         )
 
+@app.get("/debug/treatment-sample")
+async def debug_treatment_sample():
+    """Debug endpoint to see treatment index sample data"""
+    try:
+        treatment_index = client_manager.get_treatment_index()
+        if not treatment_index:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unavailable",
+                    "message": "Treatment index not available"
+                }
+            )
+        
+        # Query for a sample to see metadata structure
+        dummy_embedding = [0.1] * 1536  # Dummy embedding to get sample data
+        
+        response = treatment_index.query(
+            vector=dummy_embedding,
+            top_k=3,
+            include_metadata=True
+        )
+        
+        matches = response.get("matches", [])
+        
+        samples = []
+        for i, match in enumerate(matches):
+            metadata = match.get("metadata", {})
+            text_content = metadata.get("text", "No text field found")
+            
+            samples.append({
+                "match_index": i,
+                "score": match.get("score", 0),
+                "metadata_keys": list(metadata.keys()),
+                "has_text_field": "text" in metadata,
+                "text_preview": text_content[:300] + "..." if len(text_content) > 300 else text_content,
+                "text_length": len(text_content) if isinstance(text_content, str) else 0
+            })
+        
+        return {
+            "status": "success",
+            "total_samples": len(samples),
+            "samples": samples,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Treatment sample debug failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+
 @app.get("/debug/thread/{thread_id}")
 async def debug_thread(thread_id: str):
     """Debug endpoint to inspect thread contents"""
@@ -1525,4 +1569,51 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 # Export for Vercel
-handler = app
+handler = app 
+            if match.get("score", 0) >= config.PINECONE_SCORE_THRESHOLD
+        ]
+        
+        # Log unique diseases found
+        unique_diseases = set()
+        for match in filtered_matches:
+            disease = match["metadata"].get("disease", "Unknown")
+            unique_diseases.add(disease)
+        
+        logger.info(f"📊 Found {len(unique_diseases)} unique diseases: {list(unique_diseases)[:5]}...")
+
+        return filtered_matches
+
+    except Exception as e:
+        logger.error(f"Error querying Pinecone: {e}")
+        return []
+
+async def query_treatment_index(symptoms: List[str], context: Dict, top_k: int = 5) -> List[Dict]:
+    """Query Pinecone treatment index for Q&A snippets"""
+    try:
+        # Get treatment index
+        treatment_index = client_manager.get_treatment_index()
+        if not treatment_index:
+            logger.warning("Treatment index not available")
+            return []
+        
+        # Create query text from symptoms
+        symptoms_text = ", ".join(symptoms)
+        query_text = f"I have {symptoms_text} - what should I do?"
+        
+        logger.info(f"💊 Querying treatment index with: {query_text}")
+        
+        # Get embeddings using secondary client
+        query_embedding = await get_treatment_embeddings([query_text])
+        
+        response = treatment_index.query(
+            vector=query_embedding[0],
+            top_k=top_k,
+            include_metadata=True
+        )
+
+        matches = response.get("matches", [])
+        logger.info(f"📊 Treatment index returned {len(matches)} matches")
+
+        # Filter by score threshold (can be lower for treatment as they're more specific)
+        filtered_matches = [
+            match for match in matches
