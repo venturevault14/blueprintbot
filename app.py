@@ -504,6 +504,28 @@ async def add_message_to_thread(thread_id: str, content: str, role: str = "assis
     except Exception as e:
         logger.error(f"Error adding message to thread {thread_id}: {e}")
 
+def serialize_response_data(response_data: dict) -> str:
+    """Safely serialize response data to JSON string"""
+    try:
+        # Convert any Pydantic models to dictionaries
+        serializable_data = {}
+        for key, value in response_data.items():
+            if hasattr(value, 'dict'):  # Pydantic model
+                serializable_data[key] = value.dict()
+            elif isinstance(value, list):
+                # Handle lists that might contain Pydantic models
+                serializable_data[key] = [
+                    item.dict() if hasattr(item, 'dict') else item 
+                    for item in value
+                ]
+            else:
+                serializable_data[key] = value
+        
+        return json.dumps(serializable_data)
+    except Exception as e:
+        logger.error(f"Error serializing response data: {e}")
+        return json.dumps({"error": "Failed to serialize response"})
+
 async def generate_greeting_response(thread_id: str) -> TriageResponse:
     """Generate friendly greeting response"""
     response_data = {
@@ -527,7 +549,7 @@ async def generate_greeting_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, json.dumps(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data))
     return TriageResponse(**response_data)
 
 async def generate_thanks_response(thread_id: str) -> TriageResponse:
@@ -552,7 +574,7 @@ async def generate_thanks_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, json.dumps(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data))
     return TriageResponse(**response_data)
 
 async def generate_info_request_response(thread_id: str) -> TriageResponse:
@@ -582,7 +604,7 @@ async def generate_info_request_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, json.dumps(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data))
     return TriageResponse(**response_data)
 
 async def generate_medical_response(context: Dict, is_emergency: bool, thread_id: str) -> TriageResponse:
@@ -643,7 +665,7 @@ async def generate_medical_response(context: Dict, is_emergency: bool, thread_id
             "should_query_pinecone": should_query
         }
 
-        await add_message_to_thread(thread_id, json.dumps(response_data))
+        await add_message_to_thread(thread_id, serialize_response_data(response_data))
         return TriageResponse(**response_data)
 
     except Exception as e:
