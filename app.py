@@ -100,30 +100,25 @@ class ClientManager:
         self._pinecone_index = None
 
     async def get_openai_client(self):
-        """Get OpenAI client - initialize if needed"""
-        if self._openai_client is None:
-            if not config.OPENAI_API_KEY:
-                logger.error("❌ OpenAI API key not configured")
-                raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+        """Get OpenAI client - always create fresh for serverless"""
+        # Always create a fresh client for serverless reliability
+        try:
+            logger.info("🔑 Creating fresh OpenAI client for serverless...")
+            client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
             
-            try:
-                logger.info("🔑 Initializing OpenAI client...")
-                self._openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-                
-                # Test the connection
-                logger.info("🧪 Testing OpenAI connection...")
-                await self._openai_client.models.list()
-                logger.info("✅ OpenAI client initialized and tested successfully")
-                
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize OpenAI client: {e}")
-                self._openai_client = None  # Reset so we can retry
-                raise HTTPException(status_code=503, detail=f"OpenAI initialization failed: {str(e)}")
-        
-        return self._openai_client
+            # Quick connection test
+            logger.info("🧪 Testing OpenAI connection...")
+            await client.models.list()
+            logger.info("✅ OpenAI client created and tested successfully")
+            
+            return client
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create OpenAI client: {e}")
+            raise HTTPException(status_code=503, detail=f"OpenAI connection failed: {str(e)}")
 
     def get_pinecone_index(self):
-        """Get Pinecone index - initialize if needed (ALWAYS REQUIRED)"""
+        """Get Pinecone index - cache for performance"""
         if self._pinecone_index is None:
             if not config.PINECONE_API_KEY:
                 raise HTTPException(status_code=503, detail="Pinecone API key not configured")
@@ -189,24 +184,40 @@ class HealthResponse(BaseModel):
 # Utility Functions
 # ========================================
 
-async def validate_thread(thread_id: str) -> bool:
-    """Check if an OpenAI thread ID is valid"""
+async def validate_thread(thread_id: str, client=None) -> bool:
+    """Check if an OpenAI thread ID is valid - with retry logic"""
     if not thread_id or not thread_id.strip():
         return False
     
-    try:
-        client = await client_manager.get_openai_client()
-        await client.beta.threads.retrieve(thread_id=thread_id.strip())
-        logger.info(f"✅ Thread {thread_id} validated successfully")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Thread validation failed for {thread_id}: {e}")
-        return False
+    # Use provided client or get fresh one
+    if client is None:
+        try:
+            client = await client_manager.get_openai_client()
+        except Exception as e:
+            logger.error(f"❌ Could not get OpenAI client for thread validation: {e}")
+            return False
+    
+    # Try to retrieve the thread with retry
+    for attempt in range(2):
+        try:
+            await client.beta.threads.retrieve(thread_id=thread_id.strip())
+            logger.info(f"✅ Thread {thread_id} validated successfully (attempt {attempt + 1})")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Thread validation attempt {attempt + 1} failed for {thread_id}: {e}")
+            if attempt == 0:
+                # Try once more with a small delay
+                import asyncio
+                await asyncio.sleep(0.5)
+            
+    return False
 
-async def get_thread_context(thread_id: str) -> Dict:
+async def get_thread_context(thread_id: str, client=None) -> Dict:
     """Retrieve and analyze thread context"""
     try:
-        client = await client_manager.get_openai_client()
+        if client is None:
+            client = await client_manager.get_openai_client()
+            
         messages = await client.beta.threads.messages.list(
             thread_id=thread_id,
             order='asc',
@@ -224,7 +235,7 @@ async def get_thread_context(thread_id: str) -> Dict:
                     content = msg.content[0].text.value
                 if content:
                     user_messages.append(content)
-                    symptom_data = await extract_symptoms_comprehensive(content)
+                    symptom_data = await extract_symptoms_comprehensive(content, client)
                     all_symptoms.extend(symptom_data["symptoms"])
                     max_severity = max(max_severity, symptom_data["severity"])
 
@@ -241,10 +252,11 @@ async def get_thread_context(thread_id: str) -> Dict:
         logger.error(f"Error retrieving thread context for {thread_id}: {e}")
         return {"user_messages": [], "all_symptoms": [], "max_severity": 0}
 
-async def extract_symptoms_comprehensive(description: str) -> Dict:
+async def extract_symptoms_comprehensive(description: str, client=None) -> Dict:
     """Extract symptoms, duration, and severity from description"""
     try:
-        client = await client_manager.get_openai_client()
+        if client is None:
+            client = await client_manager.get_openai_client()
         description_lower = description.lower()
 
         # Extract severity
@@ -317,7 +329,7 @@ def is_red_flag(text: str, severity: int = 0) -> bool:
 
     return False
 
-async def classify_intent_with_gpt(message: str) -> str:
+async def classify_intent_with_gpt(message: str, client=None) -> str:
     """Classify user intent"""
     prompt = (
         "You are a classifier. Label the user message with exactly one word: "
@@ -327,7 +339,9 @@ async def classify_intent_with_gpt(message: str) -> str:
     )
 
     try:
-        client = await client_manager.get_openai_client()
+        if client is None:
+            client = await client_manager.get_openai_client()
+            
         response = await client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
@@ -492,10 +506,11 @@ async def rank_conditions(matches: List[Dict], symptoms: List[str], context: Dic
 # Response Generators
 # ========================================
 
-async def add_message_to_thread(thread_id: str, content: str, role: str = "assistant"):
+async def add_message_to_thread(thread_id: str, content: str, role: str = "assistant", client=None):
     """Helper to add message to thread"""
     try:
-        client = await client_manager.get_openai_client()
+        if client is None:
+            client = await client_manager.get_openai_client()
         await client.beta.threads.messages.create(
             thread_id=thread_id,
             role=role,
@@ -526,7 +541,7 @@ def serialize_response_data(response_data: dict) -> str:
         logger.error(f"Error serializing response data: {e}")
         return json.dumps({"error": "Failed to serialize response"})
 
-async def generate_greeting_response(thread_id: str) -> TriageResponse:
+async def generate_greeting_response(thread_id: str, client=None) -> TriageResponse:
     """Generate friendly greeting response"""
     response_data = {
         "text": (
@@ -549,10 +564,10 @@ async def generate_greeting_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, serialize_response_data(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data), client=client)
     return TriageResponse(**response_data)
 
-async def generate_thanks_response(thread_id: str) -> TriageResponse:
+async def generate_thanks_response(thread_id: str, client=None) -> TriageResponse:
     """Generate warm thank you response"""
     response_data = {
         "text": (
@@ -574,10 +589,10 @@ async def generate_thanks_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, serialize_response_data(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data), client=client)
     return TriageResponse(**response_data)
 
-async def generate_info_request_response(thread_id: str) -> TriageResponse:
+async def generate_info_request_response(thread_id: str, client=None) -> TriageResponse:
     """Generate informative response about capabilities"""
     response_data = {
         "text": (
@@ -604,10 +619,10 @@ async def generate_info_request_response(thread_id: str) -> TriageResponse:
         "should_query_pinecone": False
     }
 
-    await add_message_to_thread(thread_id, serialize_response_data(response_data))
+    await add_message_to_thread(thread_id, serialize_response_data(response_data), client=client)
     return TriageResponse(**response_data)
 
-async def generate_medical_response(context: Dict, is_emergency: bool, thread_id: str) -> TriageResponse:
+async def generate_medical_response(context: Dict, is_emergency: bool, thread_id: str, client=None) -> TriageResponse:
     """Generate comprehensive medical response with Pinecone integration"""
     try:
         symptoms = context["all_symptoms"]
@@ -665,7 +680,7 @@ async def generate_medical_response(context: Dict, is_emergency: bool, thread_id
             "should_query_pinecone": should_query
         }
 
-        await add_message_to_thread(thread_id, serialize_response_data(response_data))
+        await add_message_to_thread(thread_id, serialize_response_data(response_data), client=client)
         return TriageResponse(**response_data)
 
     except Exception as e:
@@ -706,7 +721,7 @@ async def triage(request: TriageRequest):
 
         # Step 2: Handle thread validation and creation
         try:
-            if thread_id and await validate_thread(thread_id):
+            if thread_id and await validate_thread(thread_id, client):
                 logger.info(f"✅ Using existing thread: {thread_id}")
             else:
                 logger.info("🆕 Creating new OpenAI thread...")
@@ -733,7 +748,7 @@ async def triage(request: TriageRequest):
         # Step 4: Classify intent
         try:
             logger.info("🎯 Classifying user intent...")
-            intent_label = await classify_intent_with_gpt(description)
+            intent_label = await classify_intent_with_gpt(description, client)
             logger.info(f"✅ Intent classified as: {intent_label}")
         except Exception as e:
             logger.error(f"❌ Intent classification failed: {e}")
@@ -745,20 +760,20 @@ async def triage(request: TriageRequest):
         try:
             if intent_label == "GREETING":
                 logger.info("👋 Generating greeting response...")
-                return await generate_greeting_response(thread_id)
+                return await generate_greeting_response(thread_id, client)
             elif intent_label == "THANKS":
                 logger.info("🙏 Generating thanks response...")
-                return await generate_thanks_response(thread_id)
+                return await generate_thanks_response(thread_id, client)
             elif intent_label == "INFO_REQUEST":
                 logger.info("ℹ️ Generating info response...")
-                return await generate_info_request_response(thread_id)
+                return await generate_info_request_response(thread_id, client)
             else:
                 logger.info("🏥 Processing medical request...")
                 # Handle medical requests with full Pinecone integration
-                context = await get_thread_context(thread_id)
+                context = await get_thread_context(thread_id, client)
                 is_emergency = is_red_flag(" ".join(context["user_messages"]), context["max_severity"])
                 logger.info(f"🩺 Medical context: {len(context['all_symptoms'])} symptoms, emergency: {is_emergency}")
-                return await generate_medical_response(context, is_emergency, thread_id)
+                return await generate_medical_response(context, is_emergency, thread_id, client)
         except Exception as e:
             logger.error(f"❌ Response generation failed: {e}")
             raise HTTPException(status_code=500, detail=f"Response generation failed: {str(e)}")
