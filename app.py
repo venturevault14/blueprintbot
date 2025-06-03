@@ -395,34 +395,103 @@ async def classify_intent_with_gpt(message: str, client=None) -> str:
         logger.error(f"Error in intent classification: {e}")
         return "OTHER"
 
-async def should_query_pinecone_database(context: Dict) -> bool:
-    """Determine if we should query the medical database (ALWAYS TRUE when symptoms present)"""
+async def should_query_pinecone_database(context: Dict, conversation_depth: int = 0) -> bool:
+    """Determine if we should query the medical database - more conversational approach"""
     all_symptoms = context.get("all_symptoms", [])
     symptom_count = len(all_symptoms)
     max_severity = context.get("max_severity", 0)
     full_text = " ".join(context.get("user_messages", [])).lower()
+    user_message_count = len(context.get("user_messages", []))
 
     # Always query for emergencies
     if is_red_flag(full_text, max_severity):
-        logger.info("🚨 Emergency detected - querying Pinecone")
+        logger.info("🚨 Emergency detected - querying Pinecone immediately")
         return True
 
-    # Always query when we have enough symptoms
-    if symptom_count >= config.MIN_SYMPTOMS_FOR_PINECONE:
-        logger.info(f"🔍 Sufficient symptoms ({symptom_count}) - querying Pinecone")
-        return True
-
-    # Always query for explicit condition requests
+    # For explicit "what could this be" requests - always query
     condition_keywords = [
-        "what might be", "what could be", "what is", "infection", "condition",
-        "disease", "diagnosis", "what's wrong", "what do i have"
+        "what might be", "what could be", "what is", "what do i have",
+        "diagnosis", "condition", "disease", "what's wrong with me"
     ]
     if any(keyword in full_text for keyword in condition_keywords):
         logger.info("🔍 Explicit condition request - querying Pinecone")
         return True
 
-    logger.info(f"ℹ️ Not querying Pinecone: {symptom_count} symptoms, no explicit request")
+    # NEW: More conversational approach
+    # If user has 3+ symptoms but it's still early in conversation (≤2 exchanges)
+    # Ask for more context first to be more thorough
+    if symptom_count >= config.MIN_SYMPTOMS_FOR_PINECONE:
+        if user_message_count <= 2:
+            logger.info(f"🤔 Have {symptom_count} symptoms but only {user_message_count} exchanges - gathering more context first")
+            return False
+        else:
+            logger.info(f"💡 Have {symptom_count} symptoms and {user_message_count} exchanges - ready for assessment")
+            return True
+
+    logger.info(f"📝 Continuing conversation: {symptom_count} symptoms, {user_message_count} messages")
     return False
+
+async def generate_follow_up_questions(context: Dict, client=None) -> List[str]:
+    """Generate contextual follow-up questions based on symptoms and conversation stage"""
+    try:
+        if client is None:
+            client = await client_manager.get_openai_client()
+            
+        symptoms = context.get("all_symptoms", [])
+        user_messages = context.get("user_messages", [])
+        conversation_depth = len(user_messages)
+        symptoms_text = ", ".join(symptoms) if symptoms else "general symptoms"
+
+        # Create a more detailed prompt based on conversation stage
+        if conversation_depth <= 1:
+            # Early conversation - gather basic details
+            prompt = (
+                "You are an experienced triage nurse. The patient has mentioned these symptoms: {symptoms}. "
+                "Generate 2-3 warm, empathetic follow-up questions to gather essential details. "
+                "Focus on: timing, severity, triggers, and associated symptoms. "
+                "Return JSON: {{'questions': ['question1', 'question2']}}"
+            ).format(symptoms=symptoms_text)
+        else:
+            # Deeper conversation - gather specific context
+            recent_messages = " ".join(user_messages[-2:])
+            prompt = (
+                "You are an experienced triage nurse. The patient has been telling you about: {symptoms}. "
+                "Recent conversation: '{recent}'. "
+                "Generate 2-3 specific, targeted questions to understand their condition better before assessment. "
+                "Ask about things like: impact on daily life, what makes it better/worse, other related symptoms, "
+                "medical history relevance, or specific characteristics. "
+                "Return JSON: {{'questions': ['question1', 'question2']}}"
+            ).format(symptoms=symptoms_text, recent=recent_messages)
+
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Current symptoms: {symptoms_text}"}
+            ],
+            temperature=0.4,
+            max_tokens=200
+        )
+
+        try:
+            result = json.loads(response.choices[0].message.content.strip())
+            questions = result.get("questions", [])
+            logger.info(f"💬 Generated {len(questions)} follow-up questions")
+            return questions
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse follow-up questions JSON")
+            return [
+                "Can you tell me more about when this started?",
+                "How would you rate the severity on a scale of 1-10?",
+                "Is there anything that makes it better or worse?"
+            ]
+
+    except Exception as e:
+        logger.error(f"Error generating follow-up questions: {e}")
+        return [
+            "Can you describe your symptoms in more detail?",
+            "When did you first notice these symptoms?"
+        ]
 
 async def get_embeddings(texts: List[str]) -> List[List[float]]:
     """Get embeddings from OpenAI - ALWAYS SUCCEED OR FAIL"""
@@ -658,12 +727,16 @@ async def generate_info_request_response(thread_id: str, client=None) -> TriageR
     await add_message_to_thread(thread_id, serialize_response_data(response_data), client=client)
     return TriageResponse(**response_data)
 
-async def generate_medical_response(context: Dict, is_emergency: bool, thread_id: str, client=None) -> TriageResponse:
-    """Generate comprehensive medical response with Pinecone integration"""
+async def generate_conversational_response(context: Dict, is_emergency: bool, thread_id: str, client=None) -> TriageResponse:
+    """Generate conversational medical response that feels like talking to a real nurse"""
     try:
         symptoms = context["all_symptoms"]
         symptom_count = len(symptoms)
-        should_query = await should_query_pinecone_database(context)
+        user_messages = context.get("user_messages", [])
+        conversation_depth = len(user_messages)
+        should_query = await should_query_pinecone_database(context, conversation_depth)
+
+        logger.info(f"🗣️ Generating conversational response: {symptom_count} symptoms, depth {conversation_depth}, query: {should_query}")
 
         possible_conditions = []
         if should_query:
@@ -671,46 +744,102 @@ async def generate_medical_response(context: Dict, is_emergency: bool, thread_id
             matches = await query_index(query_text, symptoms, context)
             possible_conditions = await rank_conditions(matches, symptoms, context)
 
-        symptoms_text = ", ".join(symptoms) if symptoms else "your symptoms"
-        
-        text_parts = [f"Based on your symptoms ({symptoms_text}), here's my assessment:\n"]
-
-        if possible_conditions:
-            text_parts.append("**Possible Conditions:**")
-            for i, condition in enumerate(possible_conditions[:3], 1):
-                text_parts.append(f"{i}. **{condition.name}**: {condition.description}")
-            text_parts.append("")
-
-        safety_measures = [
-            "Stay hydrated by drinking plenty of water",
-            "Get adequate rest to help your body heal",
-            "Monitor your symptoms for any changes"
-        ]
-
+        # Generate empathetic, conversational response
         if is_emergency:
-            text_parts.append("🚨 **This appears to be an emergency!**")
-            text_parts.append(f"Call {config.NIGERIA_EMERGENCY_HOTLINE} immediately or go to the nearest hospital.")
+            text_parts = [
+                "🚨 Based on what you've told me, this sounds like it could be a medical emergency.",
+                f"Please call {config.NIGERIA_EMERGENCY_HOTLINE} immediately or go to your nearest hospital emergency room.",
+                "Don't wait - it's better to be safe when it comes to your health."
+            ]
             safety_measures = [
-                f"Call {config.NIGERIA_EMERGENCY_HOTLINE} now",
-                "Do not drive yourself to the hospital",
+                f"Call {config.NIGERIA_EMERGENCY_HOTLINE} immediately",
+                "Do not drive yourself - call for help",
                 "Stay calm and follow emergency operator instructions"
             ]
-        else:
-            text_parts.append("**Recommended Action:**")
-            text_parts.append("Please see a healthcare provider for proper evaluation and treatment.")
+            triage_type = "hospital"
+            send_sos = True
+            follow_up_questions = []
+            
+        elif should_query and possible_conditions:
+            # Assessment with conditions
+            symptoms_text = ", ".join(symptoms)
+            text_parts = [
+                f"Thank you for sharing all that information with me. Based on your symptoms - {symptoms_text} - I can see why you're concerned.",
+                "",
+                "Here are some conditions that could potentially match what you're experiencing:"
+            ]
+            
+            for i, condition in enumerate(possible_conditions[:3], 1):
+                text_parts.append(f"**{i}. {condition.name}**")
+                text_parts.append(f"   {condition.description}")
+                text_parts.append("")
 
-        text_parts.append("\n*This is not a medical diagnosis. Please consult a healthcare professional.*")
+            text_parts.extend([
+                "Now, I want to be clear that this isn't a diagnosis - only a healthcare provider who can examine you properly can determine that.",
+                "",
+                "My recommendation would be to see a healthcare provider for a proper evaluation. They can do the necessary tests and examinations to give you a definitive answer.",
+                "",
+                "In the meantime, please monitor your symptoms and seek immediate care if they worsen."
+            ])
+            
+            safety_measures = [
+                "Monitor your symptoms closely",
+                "Stay hydrated and get adequate rest", 
+                "See a healthcare provider for proper evaluation",
+                "Seek immediate care if symptoms worsen"
+            ]
+            triage_type = "clinic"
+            send_sos = False
+            follow_up_questions = [
+                "Do you have any questions about these possibilities?",
+                "Is there anything else you'd like to tell me about your symptoms?"
+            ]
+            
+        else:
+            # Conversation continuation - gather more context
+            symptoms_text = ", ".join(symptoms) if symptoms else "what you're experiencing"
+            
+            if conversation_depth <= 1:
+                # Early conversation
+                text_parts = [
+                    f"I understand you're dealing with {symptoms_text}, and I want to help you figure out the best next steps.",
+                    "",
+                    "To give you the most helpful guidance, I'd like to understand your situation better:"
+                ]
+            else:
+                # Deeper conversation
+                text_parts = [
+                    f"Thank you for the additional details about {symptoms_text}.",
+                    "",
+                    "I'm getting a clearer picture of what's going on. Let me ask a few more specific questions to help guide my recommendations:"
+                ]
+            
+            # Get and add follow-up questions
+            follow_up_questions = await generate_follow_up_questions(context, client)
+            
+            for i, question in enumerate(follow_up_questions, 1):
+                text_parts.append(f"{i}. {question}")
+            
+            text_parts.extend([
+                "",
+                "Take your time answering - the more I understand about your situation, the better I can help guide you to the right care."
+            ])
+            
+            safety_measures = [
+                "Continue monitoring your symptoms",
+                "Stay hydrated and rest as needed",
+                "Contact emergency services if symptoms suddenly worsen"
+            ]
+            triage_type = "clinic"
+            send_sos = False
 
         response_data = {
             "text": "\n".join(text_parts),
             "possible_conditions": possible_conditions,
             "safety_measures": safety_measures,
-            "triage": TriageInfo(
-                type="hospital" if is_emergency else "clinic",
-                location="Unknown"
-            ),
-            "send_sos": is_emergency,
-            "follow_up_questions": ["Do you have any other symptoms?", "When did your symptoms start?"],
+            "triage": TriageInfo(type=triage_type, location="Unknown"),
+            "send_sos": send_sos,
+            "follow_up_questions": follow_up_questions,
             "thread_id": thread_id,
             "symptoms_count": symptom_count,
             "should_query_pinecone": should_query
@@ -720,10 +849,10 @@ async def generate_medical_response(context: Dict, is_emergency: bool, thread_id
         return TriageResponse(**response_data)
 
     except Exception as e:
-        logger.error(f"Error in generate_medical_response: {e}")
+        logger.error(f"❌ Error in generate_conversational_response: {e}")
         # Emergency fallback
         return TriageResponse(
-            text=f"I'm experiencing a technical issue. If this is urgent, please call {config.NIGERIA_EMERGENCY_HOTLINE}.",
+            text=f"I'm experiencing technical difficulties right now. If this is urgent, please call {config.NIGERIA_EMERGENCY_HOTLINE} immediately.",
             possible_conditions=[],
             safety_measures=["Seek immediate medical attention if urgent"],
             triage=TriageInfo(type="hospital", location="Unknown"),
@@ -809,7 +938,7 @@ async def triage(request: TriageRequest):
                 context = await get_thread_context(thread_id, client)
                 is_emergency = is_red_flag(" ".join(context["user_messages"]), context["max_severity"])
                 logger.info(f"🩺 Medical context: {len(context['all_symptoms'])} symptoms, emergency: {is_emergency}")
-                return await generate_medical_response(context, is_emergency, thread_id, client)
+                return await generate_conversational_response(context, is_emergency, thread_id, client)
         except Exception as e:
             logger.error(f"❌ Response generation failed: {e}")
             raise HTTPException(status_code=500, detail=f"Response generation failed: {str(e)}")
