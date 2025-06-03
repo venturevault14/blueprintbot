@@ -103,9 +103,23 @@ class ClientManager:
         """Get OpenAI client - initialize if needed"""
         if self._openai_client is None:
             if not config.OPENAI_API_KEY:
+                logger.error("❌ OpenAI API key not configured")
                 raise HTTPException(status_code=503, detail="OpenAI API key not configured")
-            self._openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-            logger.info("✅ OpenAI client initialized")
+            
+            try:
+                logger.info("🔑 Initializing OpenAI client...")
+                self._openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+                
+                # Test the connection
+                logger.info("🧪 Testing OpenAI connection...")
+                await self._openai_client.models.list()
+                logger.info("✅ OpenAI client initialized and tested successfully")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize OpenAI client: {e}")
+                self._openai_client = None  # Reset so we can retry
+                raise HTTPException(status_code=503, detail=f"OpenAI initialization failed: {str(e)}")
+        
         return self._openai_client
 
     def get_pinecone_index(self):
@@ -660,43 +674,161 @@ async def triage(request: TriageRequest):
 
         logger.info(f"🚀 Triage request: '{description[:50]}...', thread: {thread_id}")
 
-        # Handle thread validation and creation
-        client = await client_manager.get_openai_client()
-        
-        if thread_id and await validate_thread(thread_id):
-            logger.info(f"✅ Using existing thread: {thread_id}")
-        else:
-            new_thread = await client.beta.threads.create()
-            thread_id = new_thread.id
-            logger.info(f"🆕 Created new thread: {thread_id}")
+        # Step 1: Get OpenAI client
+        try:
+            client = await client_manager.get_openai_client()
+            logger.info("✅ OpenAI client obtained successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to get OpenAI client: {e}")
+            raise HTTPException(status_code=503, detail=f"OpenAI service unavailable: {str(e)}")
 
-        # Add user message to thread
-        await client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=description
+        # Step 2: Handle thread validation and creation
+        try:
+            if thread_id and await validate_thread(thread_id):
+                logger.info(f"✅ Using existing thread: {thread_id}")
+            else:
+                logger.info("🆕 Creating new OpenAI thread...")
+                new_thread = await client.beta.threads.create()
+                thread_id = new_thread.id
+                logger.info(f"✅ Created new thread: {thread_id}")
+        except Exception as e:
+            logger.error(f"❌ Thread management failed: {e}")
+            raise HTTPException(status_code=503, detail=f"Thread management failed: {str(e)}")
+
+        # Step 3: Add user message to thread
+        try:
+            logger.info("📝 Adding user message to thread...")
+            await client.beta.threads.messages.create(
+                thread_id=thread_id,
+                role="user",
+                content=description
+            )
+            logger.info("✅ User message added successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to add message to thread: {e}")
+            raise HTTPException(status_code=503, detail=f"Failed to add message: {str(e)}")
+
+        # Step 4: Classify intent
+        try:
+            logger.info("🎯 Classifying user intent...")
+            intent_label = await classify_intent_with_gpt(description)
+            logger.info(f"✅ Intent classified as: {intent_label}")
+        except Exception as e:
+            logger.error(f"❌ Intent classification failed: {e}")
+            # Fallback to treating as medical
+            intent_label = "OTHER"
+            logger.info("⚠️ Using fallback intent: OTHER")
+
+        # Step 5: Handle different intents
+        try:
+            if intent_label == "GREETING":
+                logger.info("👋 Generating greeting response...")
+                return await generate_greeting_response(thread_id)
+            elif intent_label == "THANKS":
+                logger.info("🙏 Generating thanks response...")
+                return await generate_thanks_response(thread_id)
+            elif intent_label == "INFO_REQUEST":
+                logger.info("ℹ️ Generating info response...")
+                return await generate_info_request_response(thread_id)
+            else:
+                logger.info("🏥 Processing medical request...")
+                # Handle medical requests with full Pinecone integration
+                context = await get_thread_context(thread_id)
+                is_emergency = is_red_flag(" ".join(context["user_messages"]), context["max_severity"])
+                logger.info(f"🩺 Medical context: {len(context['all_symptoms'])} symptoms, emergency: {is_emergency}")
+                return await generate_medical_response(context, is_emergency, thread_id)
+        except Exception as e:
+            logger.error(f"❌ Response generation failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Response generation failed: {str(e)}")
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in triage endpoint: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        # Return a safe emergency response
+        return TriageResponse(
+            text=f"I'm experiencing technical difficulties. If this is urgent, please call {config.NIGERIA_EMERGENCY_HOTLINE} immediately.",
+            possible_conditions=[],
+            safety_measures=[f"Call {config.NIGERIA_EMERGENCY_HOTLINE} if urgent", "Seek immediate medical attention"],
+            triage=TriageInfo(type="hospital", location="Unknown"),
+            send_sos=True,
+            follow_up_questions=[],
+            thread_id=thread_id or "error",
+            symptoms_count=0,
+            should_query_pinecone=False
         )
 
-        # Classify intent
-        intent_label = await classify_intent_with_gpt(description)
-        logger.info(f"🎯 Intent classified as: {intent_label}")
-
-        # Handle different intents
-        if intent_label == "GREETING":
-            return await generate_greeting_response(thread_id)
-        elif intent_label == "THANKS":
-            return await generate_thanks_response(thread_id)
-        elif intent_label == "INFO_REQUEST":
-            return await generate_info_request_response(thread_id)
-        else:
-            # Handle medical requests with full Pinecone integration
-            context = await get_thread_context(thread_id)
-            is_emergency = is_red_flag(" ".join(context["user_messages"]), context["max_severity"])
-            return await generate_medical_response(context, is_emergency, thread_id)
-
+@app.get("/test-openai")
+async def test_openai():
+    """Test OpenAI connection specifically"""
+    try:
+        logger.info("🧪 Testing OpenAI connection...")
+        client = await client_manager.get_openai_client()
+        
+        # Test 1: List models
+        models = await client.models.list()
+        logger.info(f"✅ OpenAI models retrieved: {len(models.data)} models")
+        
+        # Test 2: Simple completion
+        response = await client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Say 'test successful'"}],
+            max_tokens=10
+        )
+        result = response.choices[0].message.content.strip()
+        logger.info(f"✅ OpenAI completion test: {result}")
+        
+        return {
+            "status": "success",
+            "models_count": len(models.data),
+            "test_completion": result,
+            "timestamp": datetime.utcnow().isoformat()
+        }
     except Exception as e:
-        logger.error(f"❌ Error in triage endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"❌ OpenAI test failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+
+@app.post("/test-triage")
+async def test_triage():
+    """Simplified triage test"""
+    try:
+        logger.info("🧪 Testing simplified triage...")
+        
+        # Test data
+        test_request = TriageRequest(
+            description="Hello, how are you?",
+            thread_id=None
+        )
+        
+        # Process the request
+        result = await triage(test_request)
+        logger.info("✅ Simplified triage test successful")
+        
+        return {
+            "status": "success",
+            "result": result.dict(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"❌ Simplified triage test failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
