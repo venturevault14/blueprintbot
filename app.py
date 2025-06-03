@@ -672,13 +672,17 @@ async def query_index(query_text: str, symptoms: List[str], context: Dict, top_k
         matches = response.get("matches", [])
         logger.info(f"Pinecone returned {len(matches)} matches")
 
-        # Filter by score threshold (using 0.88 as requested)
+        # ─────── Correctly aligned list comprehension ───────
         filtered_matches = [
-            match for match in matches 
+            match for match in matches
             if match.get("score", 0) >= config.PINECONE_SCORE_THRESHOLD
         ]
-        
-        logger.info(f"✅ Selected {len(filtered_matches)} conditions after filtering (score >= {config.PINECONE_SCORE_THRESHOLD})")
+        # ─────────────────────────────────────────────────────
+
+        logger.info(
+            f"✅ Selected {len(filtered_matches)} conditions after filtering "
+            f"(score ≥ {config.PINECONE_SCORE_THRESHOLD})"
+        )
         return filtered_matches
 
     except Exception as e:
@@ -712,12 +716,13 @@ async def query_treatment_index(symptoms: List[str], context: Dict, top_k: int =
         matches = response.get("matches", [])
         logger.info(f"📊 Treatment index returned {len(matches)} matches")
 
-        # Filter by score threshold (can be lower for treatment as they're more specific)
+        # ─────── Correctly aligned list comprehension ───────
         filtered_matches = [
             match for match in matches
             if match.get("score", 0) >= 0.7  # Lower threshold for treatment
         ]
-        
+        # ─────────────────────────────────────────────────────
+
         logger.info(f"✅ Selected {len(filtered_matches)} treatment snippets after filtering")
         return filtered_matches
 
