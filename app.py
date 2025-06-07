@@ -274,12 +274,6 @@ async def chef_endpoint(req: ChefRequest):
         thread_id = req.thread_id if use_existing else (await client.beta.threads.create()).id
         logger.info(f"Thread ID: {thread_id}")
 
-        # Persist user message
-        try:
-            await insert_chat(req.user_id, "user", req.usermessage, thread_id, req.recipe_id)
-        except Exception as e:
-            logger.warning(f"Failed to persist user msg: {e}")
-
         # Build personalized instructions
         instructions = build_assistant_instructions(req.profile, req.context)
         
