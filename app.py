@@ -1,13 +1,12 @@
 import os
 import json
 import re
-import uuid
 import logging
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 from openai import AsyncOpenAI
 import httpx
 
@@ -66,7 +65,7 @@ class ClientManager:
 client_manager = ClientManager()
 
 # -------------------------
-# Helper functions to parse stringified recipe context
+# Helpers to parse stringified context
 # -------------------------
 def extract_ingredient_list(s: str) -> List[str]:
     blocks = re.findall(r"\{([^}]+)\}", s)
@@ -139,7 +138,7 @@ class ChefRequest(BaseModel):
     @field_validator('recipe_id', 'thread_id', 'context', mode='before')
     @classmethod
     def validate_null_strings(cls, v):
-        if isinstance(v, str) and v.lower() in ['null', 'none', ''] or 'null' in str(v).lower():
+        if isinstance(v, str) and (v.lower() in ['null', 'none', ''] or 'null' in v.lower()):
             return None
         return v
 
@@ -173,7 +172,7 @@ class ChefResponse(BaseModel):
     thread_id:           str
 
 # -------------------------
-# Supabase chat persistence
+# Supabase persistence
 # -------------------------
 async def insert_chat(
     user_id: str,
@@ -190,10 +189,10 @@ async def insert_chat(
         "Prefer": "return=minimal"
     }
     payload = {
-        "user_id": user_id,
-        "system":  system_role,
-        "content": content,
-        "thread_id": thread_id,
+        "user_id":    user_id,
+        "system":     system_role,
+        "content":    content,
+        "thread_id":  thread_id,
     }
     if recipe_id:
         payload["recipe_id"] = recipe_id
@@ -203,7 +202,7 @@ async def insert_chat(
         resp.raise_for_status()
 
 # -------------------------
-# OpenAI / Chef logic helpers
+# Chef logic helpers
 # -------------------------
 async def get_chef_thread_context(thread_id: str, client) -> Dict:
     try:
@@ -245,16 +244,15 @@ async def classify_chef_intent(message: str, client) -> str:
     except Exception as e:
         logger.warning(f"Intent classification failed: {e}")
 
-    # fallback keyword check
     low = message.lower()
-    if any(k in low for k in ['replace', 'substitute', 'change', 'modify']):
+    if any(k in low for k in ['replace','substitute','change','modify']):
         return "EDIT_RECIPE"
     return "OTHER"
 
 async def generate_chef_follow_up_questions(context: Dict, client) -> List[str]:
     last = context["user_messages"][-1] if context["user_messages"] else ""
     prompt = (
-        f"You are Pierre, a personal chef assistant. The user said: \"{last}\". "
+        f"You are Pierre. The user said: \"{last}\". "
         "Ask 2–3 clarifying questions about ingredients, dietary needs, time, or servings. "
         "Return JSON: {\"questions\": [...]}"
     )
@@ -289,13 +287,11 @@ async def generate_quick_recipe(
     client
 ) -> RecipeInfo:
     prof_json = json.dumps(profile.dict())
-    prof_instr = "User asked to ignore their profile—no restrictions." if ignore_flags else (
-        f"User profile JSON: {prof_json}. Do NOT suggest any ingredients that conflict with these flags."
-    )
+    instr = "ignore profile—no restrictions." if ignore_flags else f"profile JSON: {prof_json}"
     system = (
-        f"You are Pierre. {prof_instr} "
-        f"The user wants a quick recipe under {max_time} minutes using: {ingredients}. "
-        "Return JSON with keys: name, ingredients, instructions, tips."
+        f"You are Pierre. {instr} "
+        f"Make a quick recipe under {max_time} minutes using {ingredients}. "
+        "Return JSON: name, ingredients, instructions, tips."
     )
     try:
         resp = await client.chat.completions.create(
@@ -309,8 +305,8 @@ async def generate_quick_recipe(
         return RecipeInfo(
             name="Simple Recipe",
             ingredients=ingredients[:5],
-            instructions=["Combine ingredients", "Cook as desired"],
-            tips=["Adjust seasoning to taste"]
+            instructions=["Combine ingredients","Cook as desired"],
+            tips=["Adjust seasoning"]
         )
 
 async def generate_weekly_meal_plan(
@@ -320,13 +316,11 @@ async def generate_weekly_meal_plan(
     client
 ) -> MealPlan:
     prof_json = json.dumps(profile.dict())
-    prof_instr = "User asked to ignore their profile—no restrictions." if ignore_flags else (
-        f"User profile JSON: {prof_json}. Do NOT suggest any ingredients that conflict with these flags."
-    )
+    instr = "ignore profile—no restrictions." if ignore_flags else f"profile JSON: {prof_json}"
     system = (
-        f"You are Pierre. {prof_instr} "
-        f"Generate a weekly meal plan (Mon–Sun) respecting preferences: {json.dumps(preferences)}. "
-        "Return raw JSON mapping monday…sunday to objects with breakfast,lunch,dinner,snacks arrays."
+        f"You are Pierre. {instr} "
+        f"Generate a weekly meal plan respecting: {json.dumps(preferences)}. "
+        "Return JSON mapping monday…sunday to meal-day objects."
     )
     try:
         resp = await client.chat.completions.create(
@@ -337,7 +331,7 @@ async def generate_weekly_meal_plan(
         return MealPlan(**json.loads(resp.choices[0].message.content.strip()))
     except Exception as e:
         logger.error(f"Meal plan generation failed: {e}")
-        simple = RecipeInfo(name="Simple Meal", ingredients=["basic ingredients"], instructions=["Prepare as desired"], tips=[])
+        simple = RecipeInfo(name="Simple Meal", ingredients=["basic"], instructions=["Prepare"], tips=[])
         day = MealPlanDay(breakfast=[simple], lunch=[simple], dinner=[simple], snacks=[])
         return MealPlan(**{d: day for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]})
 
@@ -349,14 +343,12 @@ async def edit_existing_recipe(
     client
 ) -> RecipeInfo:
     prof_json = json.dumps(profile.dict())
-    prof_instr = "User asked to ignore their profile—no restrictions." if ignore_flags else (
-        f"User profile JSON: {prof_json}. Do NOT include conflicting ingredients."
-    )
+    instr = "ignore profile—no restrictions." if ignore_flags else f"profile JSON: {prof_json}"
     system = (
-        f"You are Pierre. {prof_instr} "
-        f"Here is a recipe JSON: {json.dumps(original.dict())} "
-        f"Apply these modifications: {modifications}. "
-        "Return full updated JSON with keys name,ingredients,instructions,tips."
+        f"You are Pierre. {instr} "
+        f"Original recipe JSON: {json.dumps(original.dict())} "
+        f"Apply modifications: {modifications}. "
+        "Return JSON: name, ingredients, instructions, tips."
     )
     try:
         resp = await client.chat.completions.create(
@@ -376,13 +368,10 @@ async def recommend_special_occasion_menu(
     client
 ) -> List[RecipeInfo]:
     prof_json = json.dumps(profile.dict())
-    prof_instr = "User asked to ignore their profile—no restrictions." if ignore_flags else (
-        f"User profile JSON: {prof_json}. Do NOT suggest any ingredients that conflict with these flags."
-    )
+    instr = "ignore profile—no restrictions." if ignore_flags else f"profile JSON: {prof_json}"
     system = (
-        f"You are Pierre. {prof_instr} "
-        f"Create a menu for a {event}. "
-        "Return JSON array of recipes with keys name,ingredients,instructions,tips."
+        f"You are Pierre. {instr} "
+        f"Create a menu for {event}. Return JSON array of recipes."
     )
     try:
         resp = await client.chat.completions.create(
@@ -393,10 +382,10 @@ async def recommend_special_occasion_menu(
         return [RecipeInfo(**r) for r in json.loads(resp.choices[0].message.content.strip())]
     except Exception as e:
         logger.error(f"Special occasion menu failed: {e}")
-        return [RecipeInfo(name="Special Dish", ingredients=["seasonal ingredients"], instructions=["Prepare with care"], tips=["Make it special"])]
+        return [RecipeInfo(name="Special Dish", ingredients=["seasonal"], instructions=["Prepare"], tips=["Make special"])]
 
 # -------------------------
-# FastAPI app & endpoints
+# FastAPI setup
 # -------------------------
 app = FastAPI(
     title="Pierre: Personal Chef Assistant API",
@@ -424,7 +413,7 @@ async def chef_endpoint(req: ChefRequest):
     try:
         client = await client_manager.get_openai_client()
 
-        # Thread management
+        # Manage thread
         use_existing = False
         if req.thread_id and req.thread_id.startswith("thread_"):
             try:
@@ -435,25 +424,27 @@ async def chef_endpoint(req: ChefRequest):
 
         thread_id = req.thread_id if use_existing else (await client.beta.threads.create()).id
 
-        # Append user message
+        # Persist user message
         try:
-            await client.beta.threads.messages.create(
-                thread_id=thread_id, role="user", content=req.usermessage
+            await insert_chat(
+                req.user_id, "user", req.usermessage, thread_id, req.recipe_id
             )
         except Exception as e:
-            logger.warning(f"Message creation failed: {e}")
+            logger.warning(f"Failed to persist user message: {e}")
 
-        intent = await classify_chef_intent(req.usermessage, client)
+        # Determine intent (override for replace/substitute)
+        low = req.usermessage.lower()
+        if any(k in low for k in ["replace","substitute","change","modify"]):
+            intent = "EDIT_RECIPE"
+        else:
+            intent = await classify_chef_intent(req.usermessage, client)
+
         ctx = await get_chef_thread_context(thread_id, client)
-        recipe_id = req.recipe_id
 
-        # Handle intents
+        # Route by intent
         if intent == "GREETING":
-            text = (
-                "Hello! 👋 I'm Pierre, your personal chef assistant. "
-                "I can help with meal plans, recipes, or editing recipes. "
-                "What would you like to do today?"
-            )
+            text = ("Hello! 👋 I'm Pierre, your personal chef assistant. "
+                    "I can help with meal plans, recipes, or editing recipes.")
             follow = [
                 "Would you like a meal plan, a quick recipe, or to edit a recipe?",
                 "Do you have any ingredients on hand right now?"
@@ -468,17 +459,13 @@ async def chef_endpoint(req: ChefRequest):
                 prefs = json.loads(req.usermessage)
             except:
                 follow = await generate_chef_follow_up_questions(ctx, client)
-                text = (
-                    "To create your weekly meal plan, please share your preferences in JSON, e.g.:\n"
-                    '{ "diet": "vegetarian", "calorie_target": 2000, "exclude_ingredients": ["dairy"] }'
-                )
+                text = ("To create your weekly meal plan, share preferences in JSON, e.g.:\n"
+                        '{ "diet": "vegetarian", "calorie_target": 2000 }')
                 resp = ChefResponse(text=text, follow_up_questions=follow, thread_id=thread_id)
             else:
-                ignore = "ignore profile" in req.usermessage.lower()
+                ignore = "ignore profile" in low
                 plan = await generate_weekly_meal_plan(prefs, req.profile, ignore, client)
-                resp = ChefResponse(
-                    text="Here's your weekly meal plan:", meal_plan=plan, thread_id=thread_id
-                )
+                resp = ChefResponse(text="Here's your weekly meal plan:", meal_plan=plan, thread_id=thread_id)
 
         elif intent == "RECIPE_REQUEST":
             ings = re.findall(r"\b\w+\b", req.usermessage)
@@ -490,70 +477,55 @@ async def chef_endpoint(req: ChefRequest):
                     thread_id=thread_id
                 )
             else:
-                ignore = "ignore profile" in req.usermessage.lower()
+                ignore = "ignore profile" in low
                 recipe = await generate_quick_recipe(ings, 30, req.profile, ignore, client)
-                recipe_id = recipe_id or str(uuid.uuid4())
                 resp = ChefResponse(
-                    text="Here's your quick recipe:", recipe=recipe,
-                    recipe_id=recipe_id, thread_id=thread_id
-                )
-
-        elif intent == "EDIT_RECIPE":
-            # require complete context
-            if not req.context \
-               or not req.context.title \
-               or not req.context.ingredients \
-               or not req.context.preparation:
-                return ChefResponse(
-                    text=(
-                        "To edit a recipe, please send me the original recipe in your `context` as JSON, e.g.:\n"
-                        "```json\n"
-                        "{\n"
-                        '  "context": {\n'
-                        '    "title": "Pancakes",\n'
-                        '    "ingredients": ["flour","milk","egg"],\n'
-                        '    "preparation": ["Mix ingredients","Cook on skillet"]\n'
-                        "  }\n"
-                        "}\n"
-                        "```"
-                    ),
-                    thread_id=thread_id
-                )
-
-            conflicts = find_conflicts_in_recipe(req.context, req.profile)
-            if conflicts and "ignore profile" not in req.usermessage.lower():
-                text = (
-                    f"I see conflicting ingredients {conflicts}. "
-                    "Proceed anyway or replace them?"
-                )
-                follow = ["Proceed ignoring profile", "Replace conflicting ingredients"]
-                resp = ChefResponse(text=text, follow_up_questions=follow, thread_id=thread_id)
-            else:
-                ignore = "ignore profile" in req.usermessage.lower()
-                original = RecipeInfo(
-                    name=req.context.title,
-                    ingredients=req.context.ingredients,
-                    instructions=req.context.preparation,
-                    tips=[]
-                )
-                edited = await edit_existing_recipe(
-                    original, req.usermessage, req.profile, ignore, client
-                )
-                resp = ChefResponse(
-                    text="Here's your edited recipe:",
-                    recipe=edited,
+                    text="Here's your quick recipe:",
+                    recipe=recipe,
                     recipe_id=req.recipe_id,
                     thread_id=thread_id
                 )
+
+        elif intent == "EDIT_RECIPE":
+            if not req.context or not req.context.title or not req.context.ingredients or not req.context.preparation:
+                resp = ChefResponse(
+                    text=(
+                        "To edit a recipe, please send the original recipe in `context`, e.g.:\n"
+                        '  "context": {"title":"Pancakes",'
+                        '"ingredients":["flour","milk"],'
+                        '"preparation":["Mix","Cook"]}'
+                    ),
+                    thread_id=thread_id
+                )
+            else:
+                conflicts = find_conflicts_in_recipe(req.context, req.profile)
+                if conflicts and "ignore profile" not in low:
+                    text = (f"I see conflicting ingredients {conflicts}. "
+                            "Proceed anyway or replace them?")
+                    follow = ["Proceed ignoring profile", "Replace conflicting ingredients"]
+                    resp = ChefResponse(text=text, follow_up_questions=follow, thread_id=thread_id)
+                else:
+                    ignore = "ignore profile" in low
+                    original = RecipeInfo(
+                        name=req.context.title,
+                        ingredients=req.context.ingredients,
+                        instructions=req.context.preparation,
+                        tips=[]
+                    )
+                    edited = await edit_existing_recipe(original, req.usermessage, req.profile, ignore, client)
+                    resp = ChefResponse(
+                        text="Here's your edited recipe:",
+                        recipe=edited,
+                        recipe_id=req.recipe_id,
+                        thread_id=thread_id
+                    )
 
         elif intent == "SPECIAL_OCCASION_REQUEST":
             if not re.search(r"\b(birthday|anniversary|party|holiday)\b", req.usermessage, re.IGNORECASE):
                 resp = ChefResponse(text="What kind of special occasion?", thread_id=thread_id)
             else:
-                ignore = "ignore profile" in req.usermessage.lower()
-                menu = await recommend_special_occasion_menu(
-                    req.usermessage, req.profile, ignore, client
-                )
+                ignore = "ignore profile" in low
+                menu = await recommend_special_occasion_menu(req.usermessage, req.profile, ignore, client)
                 text = "Here are your menu suggestions:\n" + "\n".join(f"- {r.name}" for r in menu)
                 resp = ChefResponse(text=text, thread_id=thread_id)
 
@@ -565,9 +537,9 @@ async def chef_endpoint(req: ChefRequest):
                 thread_id=thread_id
             )
 
-        # Persist bot response
+        # Persist bot response (use only the incoming recipe_id)
         try:
-            await insert_chat(req.user_id, "bot", resp.text, resp.thread_id, resp.recipe_id)
+            await insert_chat(req.user_id, "bot", resp.text, resp.thread_id, req.recipe_id)
         except Exception as e:
             logger.warning(f"Chat persistence failed: {e}")
 
@@ -578,6 +550,6 @@ async def chef_endpoint(req: ChefRequest):
         import traceback
         logger.error(traceback.format_exc())
         return ChefResponse(
-            text=f"I encountered an error: {e}. Please try a simpler request.",
-            thread_id=str(uuid.uuid4())
+            text=f"I encountered an error: {e}. Please try again.",
+            thread_id=req.thread_id or ""
         )
