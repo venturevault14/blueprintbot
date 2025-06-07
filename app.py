@@ -421,14 +421,19 @@ async def chef_endpoint(req: ChefRequest):
     try:
         client = await client_manager.get_openai_client()
 
-        # Thread management
+        # Thread management - fix thread ID validation
         use_existing = False
-        if req.thread_id:
-            try:
-                await client.beta.threads.retrieve(thread_id=req.thread_id)
-                use_existing = True
-            except Exception as e:
-                logger.warning(f"Thread retrieval failed: {e}")
+        if req.thread_id and req.thread_id.strip() and req.thread_id != "":
+            # Only try to use existing thread if it starts with 'thread_'
+            if req.thread_id.startswith('thread_'):
+                try:
+                    await client.beta.threads.retrieve(thread_id=req.thread_id)
+                    use_existing = True
+                except Exception as e:
+                    logger.warning(f"Thread retrieval failed: {e}")
+                    use_existing = False
+            else:
+                logger.info(f"Invalid thread ID format: {req.thread_id}, creating new thread")
                 use_existing = False
 
         thread_id = req.thread_id if use_existing else (await client.beta.threads.create()).id
@@ -557,8 +562,11 @@ async def chef_endpoint(req: ChefRequest):
         
     except Exception as e:
         logger.error(f"Chef endpoint error: {e}")
+        # Log the full traceback for debugging
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         # Return error response instead of raising
         return ChefResponse(
-            text="I'm experiencing some technical difficulties. Please try again.",
+            text=f"I encountered an error: {str(e)}. Please try a simpler request.",
             thread_id=str(uuid.uuid4())
         )
