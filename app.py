@@ -195,6 +195,8 @@ async def classify_chef_intent(message: str, client) -> str:
         "You are a classifier for a cooking assistant. Label the user message "
         "with exactly one of: GREETING, THANKS, RECIPE_REQUEST, "
         "MEAL_PLAN_REQUEST, EDIT_RECIPE, SPECIAL_OCCASION_REQUEST, OTHER.\n\n"
+        "EDIT_RECIPE includes: substitutions, modifications, changes to ingredients, "
+        "cooking methods, dietary adjustments, making recipes healthier/spicier, etc.\n\n"
         f"User: \"{message.strip()}\""
     )
     try:
@@ -202,16 +204,27 @@ async def classify_chef_intent(message: str, client) -> str:
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, 
-            max_tokens=4
+            max_tokens=20
         )
         label = resp.choices[0].message.content.strip().upper()
         valid = {
             "GREETING","THANKS","RECIPE_REQUEST","MEAL_PLAN_REQUEST",
             "EDIT_RECIPE","SPECIAL_OCCASION_REQUEST","OTHER"
         }
+        
+        # Add keyword-based fallback for common edit patterns
+        message_lower = message.lower()
+        edit_keywords = ['replace', 'substitute', 'change', 'modify', 'swap', 'instead of', 'use', 'different']
+        if any(keyword in message_lower for keyword in edit_keywords):
+            return "EDIT_RECIPE"
+            
         return label if label in valid else "OTHER"
     except Exception as e:
         logger.warning(f"Intent classification failed: {e}")
+        # Fallback keyword detection
+        message_lower = message.lower()
+        if any(word in message_lower for word in ['replace', 'substitute', 'change', 'modify']):
+            return "EDIT_RECIPE"
         return "OTHER"
 
 async def generate_chef_follow_up_questions(context: Dict, client) -> List[str]:
