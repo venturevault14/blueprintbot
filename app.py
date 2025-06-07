@@ -80,11 +80,21 @@ class UserProfile(BaseModel):
     other_flags:           List[str] = []
 
 class RecipeContext(BaseModel):
-    title:             str
-    description:       str
-    ingredients:       str  # Changed from List[str] to str
-    preparation:       str  # Changed from List[str] to str
+    title:             Optional[str] = None
+    description:       Optional[str] = None
+    ingredients:       Optional[str] = None
+    preparation:       Optional[str] = None
     nutrition_content: Optional[str] = None
+    
+    @field_validator('title', 'description', 'ingredients', 'preparation', 'nutrition_content', mode='before')
+    @classmethod
+    def validate_null_strings(cls, v):
+        """Convert string representations of null to actual None"""
+        if isinstance(v, str):
+            # Handle various null representations
+            if v.lower() in ['null', 'none', ''] or 'null' in v.lower():
+                return None
+        return v
 
 class ChefRequest(BaseModel):
     user_id:     str
@@ -226,10 +236,11 @@ async def generate_chef_follow_up_questions(context: Dict, client) -> List[str]:
 def find_conflicts_in_recipe(recipe: RecipeContext, profile: UserProfile) -> List[str]:
     conflicts = []
     # Convert ingredients string to lowercase for checking
-    ingredients_text = recipe.ingredients.lower()
-    for flag in profile.allergies + profile.intolerances:
-        if flag.lower() in ingredients_text:
-            conflicts.append(flag)
+    if recipe.ingredients:
+        ingredients_text = recipe.ingredients.lower()
+        for flag in profile.allergies + profile.intolerances:
+            if flag.lower() in ingredients_text:
+                conflicts.append(flag)
     return list(set(conflicts))
 
 async def generate_quick_recipe(
