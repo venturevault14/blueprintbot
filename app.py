@@ -150,6 +150,7 @@ async def insert_chat(
     user_id: str,
     system_role: str,
     content: str,
+    thread_id: str,
     recipe_id: Optional[str] = None
 ):
     url = f"{config.SUPABASE_URL}/rest/v1/chat"
@@ -163,6 +164,7 @@ async def insert_chat(
         "user_id": user_id,
         "system":  system_role,
         "content": content,
+        "thread_id": thread_id,
     }
     if recipe_id is not None:
         payload["recipe_id"] = recipe_id
@@ -534,7 +536,7 @@ async def chef_endpoint(req: ChefRequest):
 
         # Persist bot response
         try:
-            await insert_chat(req.user_id, "bot", resp.text, resp.recipe_id)
+            await insert_chat(req.user_id, "bot", resp.text, resp.thread_id, resp.recipe_id)
         except Exception as e:
             logger.warning(f"Chat persistence failed: {e}")
         
