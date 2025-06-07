@@ -62,9 +62,9 @@ client_manager = ClientManager()
 # Pydantic Models
 # -------------------------
 class RecipeContext(BaseModel):
-    title:       Optional[str]
-    description: Optional[str]
-    raw:         Optional[str]  # full original recipe as text
+    title:       Optional[str] = None
+    description: Optional[str] = None
+    raw:         Optional[str] = None  # full original recipe as text
 
 class UserProfile(BaseModel):
     dietary_preferences: List[str] = []
@@ -175,7 +175,6 @@ async def chef_endpoint(req: ChefRequest):
         if any(k in low for k in ["replace", "substitute", "change", "modify"]):
             intent = "EDIT_RECIPE"
         else:
-            # simple fallback
             if any(w in low for w in ["meal plan", "plan for"]):
                 intent = "MEAL_PLAN_REQUEST"
             elif any(w in low for w in ["recipe", "cook", "make"]):
@@ -187,23 +186,17 @@ async def chef_endpoint(req: ChefRequest):
             else:
                 intent = "OTHER"
 
+        follow: List[str] = []
         # Build response
-        follow = []
         if intent == "GREETING":
             text = "Hello! 👋 I'm Pierre, your personal chef assistant. What can I help you with today?"
         elif intent == "THANKS":
             text = "You're very welcome! 😊"
         elif intent == "MEAL_PLAN_REQUEST":
-            system = (
-                "You are Pierre, a friendly chef assistant. "
-                f"Generate a weekly meal plan in markdown based on: {req.usermessage}"
-            )
+            system = f"You are Pierre, generate a weekly meal plan in markdown based on: {req.usermessage}"
             text = await generate_markdown(system, client)
         elif intent == "RECIPE_REQUEST":
-            system = (
-                "You are Pierre, a friendly chef assistant. "
-                f"Generate a recipe in markdown using: {req.usermessage}"
-            )
+            system = f"You are Pierre, generate a recipe in markdown using: {req.usermessage}"
             text = await generate_markdown(system, client)
         elif intent == "EDIT_RECIPE":
             if not req.context or not req.context.raw:
@@ -213,18 +206,17 @@ async def chef_endpoint(req: ChefRequest):
                 )
             else:
                 system = (
-                    "You are Pierre. Here is the original recipe:\n\n"
-                    f"{req.context.raw}\n\n"
+                    f"You are Pierre. Here is the original recipe:\n\n{req.context.raw}\n\n"
                     f"Apply these modifications: {req.usermessage}\n\n"
                     "Return the full updated recipe in markdown."
                 )
                 text = await generate_markdown(system, client)
-        elif intent == "OTHER":
+        else:
+            text = "I'm not sure I understand—could you clarify?"
             follow = [
                 "Could you clarify what you'd like—meal plan, recipe, or edit?",
                 "What ingredients or contexts should I know about?"
             ]
-            text = "I'm not sure I understand—could you clarify?"
 
         # Persist bot response
         try:
