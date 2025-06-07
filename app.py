@@ -9,7 +9,7 @@ from typing import List, Optional, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from openai import AsyncOpenAI
 import httpx
 
@@ -82,8 +82,8 @@ class UserProfile(BaseModel):
 class RecipeContext(BaseModel):
     title:             str
     description:       str
-    ingredients:       List[str]
-    preparation:       List[str]
+    ingredients:       str  # Changed from List[str] to str
+    preparation:       str  # Changed from List[str] to str
     nutrition_content: Optional[str] = None
 
 class ChefRequest(BaseModel):
@@ -93,6 +93,16 @@ class ChefRequest(BaseModel):
     thread_id:   Optional[str]         = None
     context:     Optional[RecipeContext] = None
     profile:     UserProfile
+    
+    @field_validator('recipe_id', 'thread_id', 'context', mode='before')
+    @classmethod
+    def validate_null_strings(cls, v):
+        """Convert string representations of null to actual None"""
+        if isinstance(v, str):
+            # Handle various null representations
+            if v.lower() in ['null', 'none', ''] or 'null' in v.lower():
+                return None
+        return v
 
 class RecipeInfo(BaseModel):
     name:         str
@@ -215,9 +225,10 @@ async def generate_chef_follow_up_questions(context: Dict, client) -> List[str]:
 
 def find_conflicts_in_recipe(recipe: RecipeContext, profile: UserProfile) -> List[str]:
     conflicts = []
-    ings = [i.lower() for i in recipe.ingredients]
+    # Convert ingredients string to lowercase for checking
+    ingredients_text = recipe.ingredients.lower()
     for flag in profile.allergies + profile.intolerances:
-        if flag.lower() in ings:
+        if flag.lower() in ingredients_text:
             conflicts.append(flag)
     return list(set(conflicts))
 
