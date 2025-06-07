@@ -2,5 +2,5 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
 openai==1.51.0
-supabase-py>=1.0.0
+supabase==0.5.7
 python-dotenv==1.0.0
