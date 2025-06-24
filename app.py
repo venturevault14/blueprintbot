@@ -87,28 +87,30 @@ class UserBusinessProfile(BaseModel):
 
 class BusinessRequest(BaseModel):
     user_id: str
-    business_id: Optional[str] = None
+    blueprint_id: Optional[str] = None  # UUID for blueprint reference
     usermessage: str
     thread_id: Optional[str] = None
+    chat_id: Optional[str] = None  # Optional chat session ID
     blueprint: Optional[BusinessBlueprint] = None
     user_profile: UserBusinessProfile
 
-    @field_validator('business_id', 'thread_id', mode='before')
+    @field_validator('blueprint_id', 'thread_id', 'chat_id', mode='before')
     @classmethod
     def strip_null(cls, v):
         return None if isinstance(v, str) and v.lower() in {"", "null", "none"} else v
 
 class BusinessResponse(BaseModel):
     text: str
-    business_id: Optional[str] = None
+    blueprint_id: Optional[str] = None
     thread_id: str
+    chat_id: Optional[str] = None
     follow_up_questions: List[str] = []
     recommended_actions: List[str] = []
 
 # -------------------------
 # Supabase persistence
 # -------------------------
-async def insert_business_chat(user_id: str, system: str, content: str, thread_id: str, business_id: Optional[str] = None):
+async def insert_chat(user_id: str, system: str, content: str, thread_id: str, blueprint_id: Optional[str] = None, chat_id: Optional[str] = None):
     url = f"{config.SUPABASE_URL}/rest/v1/chat"
     headers = {
         "apikey": config.SUPABASE_KEY,
@@ -122,8 +124,10 @@ async def insert_business_chat(user_id: str, system: str, content: str, thread_i
         "content": content,
         "thread_id": thread_id
     }
-    if business_id:
-        payload["business_id"] = business_id
+    if blueprint_id:
+        payload["blueprint_id"] = blueprint_id
+    if chat_id:
+        payload["chat_id"] = chat_id
 
     async with httpx.AsyncClient() as client:
         r = await client.post(url, json=payload, headers=headers)
@@ -417,14 +421,15 @@ async def business_endpoint(req: BusinessRequest):
 
         # Persist bot response
         try:
-            await insert_business_chat(req.user_id, "bot", response_text, thread_id, req.business_id)
+            await insert_chat(req.user_id, "bot", response_text, thread_id, req.blueprint_id, req.chat_id)
         except Exception as e:
             logger.warning(f"Failed to persist bot msg: {e}")
 
         return BusinessResponse(
             text=response_text,
-            business_id=req.business_id,
+            blueprint_id=req.blueprint_id,
             thread_id=thread_id,
+            chat_id=req.chat_id,
             follow_up_questions=[],  # Empty since they're now in the text
             recommended_actions=[]   # Empty since they're now in the text
         )
@@ -436,8 +441,9 @@ async def business_endpoint(req: BusinessRequest):
         
         return BusinessResponse(
             text="I'm having trouble processing your request right now. Let's get back to building your business - could you try rephrasing your question?",
-            business_id=req.business_id,
+            blueprint_id=req.blueprint_id,
             thread_id=req.thread_id or "error",
+            chat_id=req.chat_id,
             follow_up_questions=["Could you try asking in a different way?"],
             recommended_actions=["Check the Blueprint Lab toolkit for immediate resources"]
         )
